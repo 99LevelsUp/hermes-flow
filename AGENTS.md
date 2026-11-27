@@ -52,7 +52,7 @@ Work on this repository follows the skill it contains: `skills/roadmap-issue-flo
 - Tests: none yet (issue "Tests and CI for the triage script"). Until they exist, every change to
   the triage script is verified with `--dry-run --only <issues>` before deploying.
 
-CI (`.github/workflows/ci.yml`, pending the token's `workflow` scope) runs the same checks on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs the same checks on every push and pull request.
 
 ## Security
 
