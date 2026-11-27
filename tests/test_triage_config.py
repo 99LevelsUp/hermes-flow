@@ -17,6 +17,12 @@ spec = importlib.util.spec_from_file_location("issue_triage", SCRIPT)
 assert spec and spec.loader
 t = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(t)
+# tests never touch the live data directory (log, ledger, state, context)
+_DATA = tempfile.mkdtemp(prefix="triage-test-")
+for _name in ("HOME", "MIRRORS", "CONTEXT", "LEDGER", "STATE", "LOG"):
+    if hasattr(t, _name):
+        setattr(t, _name, os.path.join(_DATA, os.path.basename(getattr(t, _name))))
+setattr(t, "HOME", _DATA)
 
 STATUS = ("Backlog", "Needs decision", "Reject proposed", "Ready", "In progress", "Done")
 NEXT = ("Ideate", "Brainstorm", "Decide", "Debug", "Reject", "Done")
