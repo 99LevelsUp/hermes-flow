@@ -1,0 +1,5 @@
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E9", "F"]   # widen to E4, E7 and B in its own change (issue: full lint set)

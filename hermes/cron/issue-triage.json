@@ -1,0 +1,9 @@
+{
+  "_comment": "Definition of the Hermes cron job that runs the triage script. Create it with the cronjob tool (action=create) using these fields; Hermes stores the live job in ~/.hermes/cron/jobs.json.",
+  "name": "issue-triage",
+  "prompt": "Issue triage for the roadmaps: estimate, classify, link and route GitHub issues (script-only job).",
+  "script": "issue-triage.py",
+  "no_agent": true,
+  "schedule": "every 15m",
+  "deliver": "origin"
+}
