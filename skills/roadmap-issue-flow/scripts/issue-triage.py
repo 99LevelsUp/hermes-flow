@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Issue triage for the EVƎ roadmap (https://github.com/users/99LevelsUp/projects/3).
+"""Issue triage for GitHub Projects v2 roadmaps listed in ~/.hermes/data/issue-triage/config.json.
+
+The configuration names each project (owner, number) and its repositories (optional Product option and
+extra labels per repository); IDs of fields, options and issue types are looked up by name at start.
+A project that lacks a required field or option is skipped with a notice; the others keep running.
 
 Step 3 (triage) of the owner's roadmap-issue-flow. Every run handles:
   umbrella   open issue with sub-issues, no model: Estimate = sum of its sub-issues (recursive),
@@ -17,8 +21,8 @@ only picks among them, any number.
 
 The model is Claude Haiku under `claude --restricted` (read-only file tools, no shell, no network
 tools). Issue text is untrusted (public repos): the script does all writes, validates every value,
-withholds the text of outside authors' candidate issues and neutralises what it posts. No tests
-exist yet, so these rules are enforced only by this file: Priority and milestone are never touched;
+withholds the text of outside authors' candidate issues and neutralises what it posts. These rules
+are enforced by this file (tests cover the configuration and some pure functions): Priority and milestone are never touched;
 Status is written only when empty, Backlog -> Reject proposed, Backlog -> Needs decision for an
 outside author's idea, and on umbrellas; Next step is written last because it marks an issue as
 triaged; an issue with any outside author in its thread is analysed alone.
@@ -30,28 +34,30 @@ import argparse, fcntl, json, os, re, shutil, subprocess, sys, time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import quote
 
-OWNER = "99LevelsUp"
-REPOS = {"ev3-c": "EVƎ C", "ev3-cockpit": "EVƎ Cockpit"}
-PROJECT_ID = "PVT_kwHOAV2Xg84BtD92"
-F_ESTIMATE = "PVTF_lAHOAV2Xg84BtD92zhrfQig"
-F_STATUS = "PVTSSF_lAHOAV2Xg84BtD92zhrPK7g"
-F_PRODUCT = "PVTSSF_lAHOAV2Xg84BtD92zhrPLRE"
-F_NEXT = "PVTSSF_lAHOAV2Xg84BtD92zhriBWY"
 BACKLOG, NEEDS_DECISION, REJECT_PROPOSED = "Backlog", "Needs decision", "Reject proposed"
 READY, IN_PROGRESS, DONE = "Ready", "In progress", "Done"
-OPT_STATUS = {BACKLOG: "ac92864b", NEEDS_DECISION: "040646a7", REJECT_PROPOSED: "46eb73f4",
-              READY: "37f6b4ff", IN_PROGRESS: "1a77e8e7", DONE: "9cef0aeb"}
 # an umbrella shows its least advanced sub-issue; a pending owner decision anywhere below comes first
 UMBRELLA_RANK = {NEEDS_DECISION: 0, REJECT_PROPOSED: 0, BACKLOG: 1, READY: 2, IN_PROGRESS: 3, DONE: 4}
 RANK_STATUS = {0: NEEDS_DECISION, 1: BACKLOG, 2: READY, 3: IN_PROGRESS, 4: DONE}
-OPT_PRODUCT = {"EVƎ Cockpit": "9797a7c3", "EVƎ C": "e13fec21"}
-OPEN_STEPS = {"Ideate": "b957cc3f", "Brainstorm": "d0ba2ffa", "Decide": "8949e511", "Debug": "b3bc4bb6",
-              "Reject": "4017df8e"}
-OPT_NEXT = {**OPEN_STEPS, "Done": "6e266aa3"}
-TYPE_IDS = {"Task": "IT_kwDOAV2Xg84FwlCP", "Bug": "IT_kwDOAV2Xg84FwlCQ", "Feature": "IT_kwDOAV2Xg84FwlCR"}
-COMMON_LABELS = {"idea", "needs-brick", "documentation", "needs-prototype", "needs-bakeoff"}
-REPO_LABELS = {"ev3-c": COMMON_LABELS | {"education", "accessibility", "backlog"}, "ev3-cockpit": COMMON_LABELS}
+OPEN_STEPS = ("Ideate", "Brainstorm", "Decide", "Debug", "Reject")
+ISSUE_TYPES = ("Bug", "Feature", "Task")
+# project fields the script needs, with the options it writes (None: not a single-select field)
+REQUIRED_FIELDS = {"Status": (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED, READY, IN_PROGRESS, DONE),
+                   "Estimate": None, "Next step": (*OPEN_STEPS, "Done")}
+BASE_LABELS = {
+    "idea": "the issue has not yet passed the gate to Ready (brainstorm + document review). A Backlog issue that "
+            "is still a raw idea keeps it.",
+    "documentation": "the work is mainly documentation.",
+}
+FLAG_LABELS = {      # flags, independent of the next step
+    "needs-prototype": "the main open question is how something should behave, look or read, and only a throwaway "
+                       "prototype tried by a human settles it (UI, displays, UX flows).",
+    "needs-bakeoff": "the goal is clear but the solution is open, and developing 2-3 competing approaches and "
+                     "comparing them is worth it (typically architecture).",
+}
+COMMON_LABELS = {**BASE_LABELS, **FLAG_LABELS}
 IDEA_ALLOWED_STATUSES = (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED)
 IDEA_FORBIDDEN_STATUSES = (READY, IN_PROGRESS, DONE)
 TRUSTED_AUTHORS = ("OWNER", "MEMBER", "COLLABORATOR")
@@ -78,6 +84,7 @@ ESTIMATES_MARK = MARK_PREFIX + "estimates -->"
 OUTSIDE_SOURCE_RE = re.compile(r"^Source:.*\(outside author\)", re.M | re.I)
 
 HOME = os.path.expanduser("~/.hermes/data/issue-triage")
+CONFIG = os.path.join(HOME, "config.json")
 MIRRORS = os.path.join(HOME, "repos")
 CONTEXT = os.path.join(HOME, "context")
 LEDGER = os.path.join(HOME, "ledger.jsonl")
@@ -93,6 +100,140 @@ DEADLINE = time.time() + RUN_BUDGET_S
 
 class Outage(RuntimeError):
     pass
+
+
+class ConfigError(ValueError):
+    pass
+
+
+class Project:
+    """One roadmap: a GitHub Projects v2 board and the repositories whose issues it holds. IDs of the
+    project, its fields, their options and the owner's issue types are looked up by name (discover)."""
+
+    def __init__(self, owner, number, repos):
+        self.owner, self.number, self.repos = owner, number, repos
+        self.id, self.fields, self.options, self.types = None, {}, {}, {}
+
+    def __repr__(self):
+        return f"{self.owner}/projects/{self.number}"
+
+    def field(self, name):
+        return self.fields[name]
+
+    def option(self, field, name):
+        return self.options[field][name]
+
+    def product(self, repo):
+        """The Product option configured for repo, or None."""
+        return self.repos[repo].get("product")     # discover() checked that the option exists
+
+    def labels(self, repo):
+        """Labels triage may set in repo, with what each means."""
+        return {**COMMON_LABELS, **self.repos[repo].get("labels", {})}
+
+
+PROJECTS = []           # the configured projects that discovery accepted
+REPO_PROJECT = {}       # repository name -> Project
+
+
+def load_config(path=CONFIG):
+    """Projects from the configuration file; raises ConfigError with a message for the owner."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ConfigError(f"no configuration at {path}") from None
+    except (OSError, json.JSONDecodeError) as e:
+        raise ConfigError(f"configuration {path} unreadable: {e}") from None
+    projects, seen = [], set()
+    if not isinstance(data, dict) or set(data) != {"projects"}:
+        raise ConfigError(f"configuration {path} must be an object with the single key 'projects'")
+    listed = data["projects"]
+    if not isinstance(listed, list) or not listed:
+        raise ConfigError(f"configuration {path} needs a non-empty list 'projects'")
+    for i, p in enumerate(listed, 1):
+        if not isinstance(p, dict) or set(p) != {"owner", "number", "repos"}:
+            raise ConfigError(f"project {i}: needs exactly the keys owner, number and repos")
+        owner, number, repos = p["owner"], p["number"], p["repos"]
+        if not (isinstance(owner, str) and owner and type(number) is int and number > 0
+                and isinstance(repos, dict) and repos):
+            raise ConfigError(f"project {i}: owner must be text, number a positive integer, repos a non-empty object")
+        for name, repo in repos.items():
+            if name in seen:
+                raise ConfigError(f"repository {name} is listed twice; repository names must be unique")
+            seen.add(name)
+            if not isinstance(repo, dict) or not set(repo) <= {"product", "labels"}:
+                raise ConfigError(f"repository {name}: an object with the optional keys product and labels")
+            labels = repo.get("labels", {})
+            if not (isinstance(repo.get("product", ""), str) and isinstance(labels, dict)
+                    and all(isinstance(k, str) and k and isinstance(v, str) for k, v in labels.items())):
+                raise ConfigError(f"repository {name}: product must be text and labels map names to meanings (text)")
+        projects.append(Project(owner, number, repos))
+    return projects
+
+
+_PROJECT_SEL = ("id fields(first:100){nodes{... on ProjectV2FieldCommon{id name} "    # boards allow at most 50
+                "... on ProjectV2SingleSelectField{options{id name}}}}")
+DISCOVER_Q = ("query($owner:String!,$n:Int!){repositoryOwner(login:$owner){"
+              f"... on User{{projectV2(number:$n){{{_PROJECT_SEL}}}}} "
+              f"... on Organization{{projectV2(number:$n){{{_PROJECT_SEL}}}}}}}}}")
+TYPES_Q = """query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){
+ issueTypes(first:25){nodes{id name}}}}"""
+
+
+def lookup(what, query, **variables):
+    """gql for discovery: a thing GitHub cannot find is a configuration error, not an outage."""
+    try:
+        return gql(query, **variables)
+    except Outage:
+        raise
+    except RuntimeError as e:
+        if "Could not resolve" in str(e) or "NOT_FOUND" in str(e):
+            raise ConfigError(f"{what} not found or not readable with this token") from None
+        raise
+
+
+def discover(project):
+    """Fill in the IDs of project; raises ConfigError when something the script writes is missing."""
+    owner = lookup(str(project), DISCOVER_Q, owner=project.owner, n=project.number).get("repositoryOwner") or {}
+    board = owner.get("projectV2")
+    if not board:
+        raise ConfigError(f"{project}: project not found or not readable with this token")
+    project.id = board["id"]
+    for node in board["fields"]["nodes"]:
+        if node.get("name"):
+            project.fields[node["name"]] = node["id"]
+            if "options" in node:
+                project.options[node["name"]] = {o["name"]: o["id"] for o in node["options"]}
+    for name, wanted in REQUIRED_FIELDS.items():
+        if name not in project.fields:
+            raise ConfigError(f"{project}: field '{name}' is missing")
+        missing = [o for o in wanted or () if o not in project.options.get(name, {})]
+        if missing:
+            raise ConfigError(f"{project}: field '{name}' lacks the options {', '.join(missing)}")
+    for name, cfg in project.repos.items():
+        if cfg.get("product") and cfg["product"] not in project.options.get("Product", {}):
+            raise ConfigError(f"{project}: Product option '{cfg['product']}' (for {name}) does not exist")
+        repository = lookup(f"{project.owner}/{name}", TYPES_Q, owner=project.owner, repo=name).get("repository")
+        if not repository:
+            raise ConfigError(f"{project}: repository {project.owner}/{name} not found or not readable")
+        types = {t["name"]: t["id"] for t in repository["issueTypes"]["nodes"]}
+        missing = [t for t in ISSUE_TYPES if t not in types]
+        if missing:
+            raise ConfigError(f"{project}: {name} has no issue types {', '.join(missing)}")
+        if project.types and any(project.types[t] != types[t] for t in ISSUE_TYPES):
+            raise ConfigError(f"{project}: the repositories have different issue types")
+        project.types = types
+
+
+def use_projects(projects):
+    PROJECTS[:] = projects
+    REPO_PROJECT.clear()
+    REPO_PROJECT.update({name: p for p in projects for name in p.repos})
+
+
+def proj(issue_or_repo):
+    return REPO_PROJECT[issue_or_repo if isinstance(issue_or_repo, str) else issue_or_repo["repo"]]
 
 
 def log(msg):
@@ -113,9 +254,10 @@ def issue_key(repo, number):
 
 
 def node_key(node):
-    """Key of an issue node from GraphQL, or None when it lives outside the watched repositories."""
+    """Key of an issue node from GraphQL, or None when it lives outside the configured repositories."""
     owner, _, name = node["repository"]["nameWithOwner"].partition("/")
-    return issue_key(name, node["number"]) if owner == OWNER and name in REPOS else None
+    p = REPO_PROJECT.get(name)
+    return issue_key(name, node["number"]) if p and p.owner == owner else None
 
 
 def model_key(repo, number):
@@ -177,15 +319,15 @@ FIELDS = """est:fieldValueByName(name:"Estimate"){... on ProjectV2ItemFieldNumbe
     status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
     product:fieldValueByName(name:"Product"){... on ProjectV2ItemFieldSingleSelectValue{name}}"""
 
-LIST_Q = """query($repo:String!,$after:String){repository(owner:"%s",name:$repo){
+LIST_Q = """query($owner:String!,$repo:String!,$after:String){repository(owner:$owner,name:$repo){
  issues(states:[OPEN,CLOSED],first:100,after:$after,orderBy:{field:CREATED_AT,direction:ASC}){
   pageInfo{hasNextPage endCursor}
   nodes{number title state stateReason authorAssociation
    timelineItems(itemTypes:[REOPENED_EVENT]){totalCount}
    subIssues(first:100){totalCount nodes{number repository{nameWithOwner}}}
-   projectItems(first:20){nodes{id project{id} %s}}}}}}""" % (OWNER, FIELDS)
+   projectItems(first:20){nodes{id project{id} %s}}}}}}""" % FIELDS
 
-ISSUE_Q = """query($repo:String!,$n:Int!){repository(owner:"%s",name:$repo){issue(number:$n){
+ISSUE_Q = """query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){issue(number:$n){
  id number title body state stateReason closedAt authorAssociation author{login} issueType{name} milestone{title}
  labels(first:50){nodes{name}}
  timelineItems(itemTypes:[REOPENED_EVENT]){totalCount}
@@ -193,17 +335,17 @@ ISSUE_Q = """query($repo:String!,$n:Int!){repository(owner:"%s",name:$repo){issu
  subIssues(first:100){totalCount nodes{number title state repository{nameWithOwner}}}
  relatesTo(first:100){totalCount nodes{number repository{nameWithOwner}}}
  comments(last:100){totalCount nodes{author{login} authorAssociation createdAt body}}
- projectItems(first:20){nodes{id project{id} %s}}}}}""" % (OWNER, FIELDS)
+ projectItems(first:20){nodes{id project{id} %s}}}}}""" % FIELDS
 ISSUE_Q_FULL = ISSUE_Q % ("subIssues(first:100){nodes{id number title state body authorAssociation "
                           "repository{nameWithOwner}}}")
 ISSUE_Q_LEAN = ISSUE_Q % ""
 
-BRIEF_Q = """query($repo:String!,$n:Int!){repository(owner:"%s",name:$repo){issueOrPullRequest(number:$n){
- __typename ... on Issue{id number title state body authorAssociation}}}}""" % OWNER
+BRIEF_Q = """query($owner:String!,$repo:String!,$n:Int!){repository(owner:$owner,name:$repo){
+ issueOrPullRequest(number:$n){__typename ... on Issue{id number title state body authorAssociation}}}}"""
 
 
-def project_fields(nodes):
-    item = next((p for p in nodes if p["project"]["id"] == PROJECT_ID), None) or {}
+def project_fields(nodes, project):
+    item = next((p for p in nodes if p["project"]["id"] == project.id), None) or {}
     estimate = (item.get("est") or {}).get("number")
     return dict(item=item.get("id"), estimate=None if estimate is None else round(estimate),
                 next_step=(item.get("next") or {}).get("name"), status=(item.get("status") or {}).get("name"),
@@ -227,12 +369,13 @@ def wanted_mode(s, state):
 
 
 def list_index():
-    """Summaries of all issues of the watched repositories, by key."""
+    """Summaries of all issues of the configured repositories, by key."""
     index = {}
-    for repo in REPOS:
+    for repo, project in REPO_PROJECT.items():
         after = None
         while True:
-            d = gql(LIST_Q, repo=repo, **({"after": after} if after else {}))["repository"]["issues"]
+            d = gql(LIST_Q, owner=project.owner, repo=repo,
+                    **({"after": after} if after else {}))["repository"]["issues"]
             for n in d["nodes"]:
                 key = issue_key(repo, n["number"])
                 index[key] = dict(key=key, repo=repo, number=n["number"], title=n["title"],
@@ -241,7 +384,7 @@ def list_index():
                                   reopened=n["timelineItems"]["totalCount"] > 0,
                                   subs=[k for k in map(node_key, n["subIssues"]["nodes"]) if k],
                                   subs_total=n["subIssues"]["totalCount"],
-                                  **project_fields(n["projectItems"]["nodes"]))
+                                  **project_fields(n["projectItems"]["nodes"], project))
             if not d["pageInfo"]["hasNextPage"]:
                 break
             after = d["pageInfo"]["endCursor"]
@@ -249,7 +392,8 @@ def list_index():
 
 
 def load_issue(repo, number, lean=False):
-    n = gql(ISSUE_Q_LEAN if lean else ISSUE_Q_FULL, repo=repo, n=number)["repository"]["issue"]
+    project = proj(repo)
+    n = gql(ISSUE_Q_LEAN if lean else ISSUE_Q_FULL, owner=project.owner, repo=repo, n=number)["repository"]["issue"]
     comments = n["comments"]["nodes"]
     author_trusted = n["authorAssociation"] in TRUSTED_AUTHORS
     trusted = (author_trusted and n["comments"]["totalCount"] <= len(comments)
@@ -264,15 +408,15 @@ def load_issue(repo, number, lean=False):
                 subs=n["subIssues"]["nodes"], subs_total=n["subIssues"]["totalCount"], comments=comments,
                 related={k for k in map(node_key, n["relatesTo"]["nodes"]) if k},
                 related_complete=n["relatesTo"]["totalCount"] <= len(n["relatesTo"]["nodes"]),
-                **project_fields(n["projectItems"]["nodes"]))
+                **project_fields(n["projectItems"]["nodes"], project))
 
 
 def refresh_mirrors():
     os.makedirs(MIRRORS, exist_ok=True)
-    for repo in REPOS:
+    for repo, project in REPO_PROJECT.items():
         path = os.path.join(MIRRORS, repo)
         if not os.path.isdir(os.path.join(path, ".git")):
-            gh("repo", "clone", f"{OWNER}/{repo}", path, "--", "-q", "-c", "core.symlinks=false", timeout=600)
+            gh("repo", "clone", f"{project.owner}/{repo}", path, "--", "-q", "-c", "core.symlinks=false", timeout=600)
         else:
             run(["git", "-C", path, "config", "core.symlinks", "false"])
             run(["git", "-C", path, "fetch", "-q", "--prune", "origin"], timeout=300)
@@ -281,7 +425,14 @@ def refresh_mirrors():
 
 _last_search = [0.0]
 _search_down = [False]          # after one failed search the rest of the run skips searching
-MENTION_RE = re.compile(r"(?:\b(ev3-c|ev3-cockpit)#|(?<![\w/#])#)(\d{1,6})\b")
+MENTION_RE = re.compile(r"(?:\b([\w.-]+)#|(?<![\w/#])#)(\d{1,6})\b")
+
+
+def mention_keys(text, own_repo):
+    """Issue keys mentioned in text (repo#N or #N), only within own_repo's project, in order, unique."""
+    repos = proj(own_repo).repos
+    found = (issue_key(repo or own_repo, int(n)) for repo, n in MENTION_RE.findall(text or ""))
+    return list(dict.fromkeys(k for k in found if k.partition("#")[0] in repos))
 
 
 def query_text(text):
@@ -296,11 +447,12 @@ def hybrid_search(repo, text):
     if wait > 0:
         time.sleep(wait)
     _last_search[0] = time.time()
-    out = gh("api", "-X", "GET", "search/issues", "-f", f"q=is:issue repo:{OWNER}/{repo} {text}",
+    full = f"{proj(repo).owner}/{repo}"
+    out = gh("api", "-X", "GET", "search/issues", "-f", f"q=is:issue repo:{full} {text}",
              "-f", "search_type=hybrid", "-f", f"per_page={SEARCH_RESULTS}", retry=False)
-    want = f"https://api.github.com/repos/{OWNER}/{repo}"
+    want = f"https://api.github.com/repos/{full}".lower()
     return [it for it in json.loads(out).get("items", [])
-            if it.get("repository_url") == want and "pull_request" not in it]
+            if it.get("repository_url", "").lower() == want and "pull_request" not in it]
 
 
 def find_candidates(issue):
@@ -310,8 +462,10 @@ def find_candidates(issue):
         excluded.add(node_key(issue["parent"]))
     cands, complete = {}, issue["related_complete"]
 
+    own_repos = proj(issue).repos
+
     def add(key, title, state, node_id, body, association, why):
-        if key in excluded:
+        if key in excluded or key.partition("#")[0] not in own_repos:      # links stay within the project
             return
         outside = association not in TRUSTED_AUTHORS
         c = cands.setdefault(key, dict(key=key, title=title, state=state.lower(), id=node_id, outside=outside,
@@ -319,7 +473,7 @@ def find_candidates(issue):
                                        found_by=set()))
         c["found_by"].add(why)
 
-    for repo in REPOS:
+    for repo in proj(issue).repos:
         for q in dict.fromkeys(q for q in (query_text(issue["title"]), query_text(issue["body"])) if q):
             if _search_down[0]:
                 complete = False
@@ -339,18 +493,14 @@ def find_candidates(issue):
     texts = [issue["body"]] if issue["author_trusted"] else []
     texts += [c["body"] for c in issue["comments"]
               if c["authorAssociation"] in TRUSTED_AUTHORS and not c["body"].startswith(MARK_PREFIX)]
-    mentioned = []
-    for repo, n in MENTION_RE.findall("\n".join(texts)):
-        key = issue_key(repo or issue["repo"], int(n))
-        if key not in excluded and key not in mentioned:
-            mentioned.append(key)
+    mentioned = [k for k in mention_keys("\n".join(texts), issue["repo"]) if k not in excluded]
     for key in mentioned[:MAX_MENTIONS]:
         if key in cands:
             cands[key]["found_by"].add("mentioned")
             continue
         repo, _, n = key.partition("#")
         try:
-            b = gql(BRIEF_Q, repo=repo, n=int(n))["repository"]["issueOrPullRequest"]
+            b = gql(BRIEF_Q, owner=proj(repo).owner, repo=repo, n=int(n))["repository"]["issueOrPullRequest"]
         except RuntimeError as e:
             if isinstance(e, Outage) or "Could not resolve" not in str(e):
                 complete = False
@@ -423,14 +573,23 @@ TYPE_RULES = ("Bug (something that exists behaves wrongly), Feature (new user-vi
               "behaviour), Task (work that is neither: docs, process, release, CI, refactoring, tooling, "
               "hardware acceptance runs, decisions)")
 
-RULES = f"""Classification rules (the owner's process):
+def label_rules(project):
+    """The labels triage may set in the project's repositories, with their meanings, for the prompt."""
+    lines = [f"- {name}: {text}" for name, text in BASE_LABELS.items()]
+    extra = {}
+    for repo, cfg in project.repos.items():
+        for name, text in cfg.get("labels", {}).items():
+            extra.setdefault((name, text), []).append(repo)
+    lines += [f"- {name} (only in {', '.join(repos)}): {text}" for (name, text), repos in extra.items()]
+    return "\n".join(lines)
+
+
+def rules(project):
+    return f"""Classification rules (the owner's process):
 - Issue type (GitHub issue type), exactly one: {TYPE_RULES}.
 - The kind of work is expressed ONLY by the issue type. There are no labels bug, enhancement or task; never propose them.
-- Labels you may add or remove: idea, needs-brick, documentation, needs-prototype, needs-bakeoff, and in ev3-c also education, accessibility, backlog. Leave all other labels alone.
-- idea: the issue has not yet passed the gate to Ready (brainstorm + document review). A Backlog issue that is still a raw idea keeps it.
-- needs-brick: completing the issue requires a real EV3 brick (hardware verification or measurement).
-- documentation: the work is mainly documentation.
-- education, accessibility, backlog (ev3-c only): only when the issue is clearly about that.
+- Labels you may add or remove are listed below (each only in the repositories named); leave all other labels alone.
+{label_rules(project)}
 
 Next step (exactly one per issue):
 - Ideate (ce-ideate): the issue covers MORE THAN ONE separate problem, or names only an area/goal without a concrete behaviour. Ideation will split it into one sub-issue per problem (with order and dependencies); the issue itself becomes an umbrella.
@@ -439,8 +598,7 @@ Next step (exactly one per issue):
 - Debug (ce-debug): something that exists behaves wrongly; diagnosis comes first.
 - Reject: recommend closing as "not planned" - a duplicate of another open issue, already done, obsolete, contrary to the recorded strategy or decisions (STRATEGY.md, REQUIREMENTS.md, owner's comments), not actionable, not actually a bug, or spam. The owner decides; give the reason and the evidence.
 Flags, independent of the next step, as labels (only when clearly needed):
-- needs-prototype: the main open question is how something should behave, look or read, and only a throwaway prototype tried by a human settles it (UI, LCD, UX flows).
-- needs-bakeoff: the goal is clear but the solution is open, and developing 2-3 competing approaches and comparing them is worth it (typically architecture).
+""" + "\n".join(f"- {name}: {text}" for name, text in FLAG_LABELS.items()) + """
 Judge from the issue's own text and comments; ignore its current project status when choosing the next step."""
 
 RELATED_RULES = """Related issues (GitHub "relates to" links), chosen ONLY from the candidates listed at the end of the issue's file:
@@ -452,7 +610,7 @@ RELATED_RULES = """Related issues (GitHub "relates to" links), chosen ONLY from 
 RECORD = """The result is also written to the issue as the triage record. The NEXT agent (who runs the next step) has NO other context than the issue and this record, so make it a good starting position:
 - summary: what the issue asks for, in your own words (2-4 sentences).
 - current_state: what already exists in the repository for it and what is missing, with concrete file paths and commit hashes you saw; say so if you found nothing.
-- prior_decisions: decisions already recorded in the body or comments, each as one line naming who made it (only the owner, 99LevelsUp, can decide) and where.
+- prior_decisions: decisions already recorded in the body or comments, each as one line naming who made it (only the owner, {owner}, can decide) and where.
 - estimate_basis: what the minutes consist of (main cost drivers, assumptions, what could make it much bigger or smaller).
 - type_reason, labels_reason, next_step_reason: the justification of each value.
 - alternatives: the other next steps (and types if close) that were possible, each with why it fits worse.
@@ -471,29 +629,40 @@ EFFORT_RULES = f"""Effort: the expected effort in MINUTES ({MIN_MINUTES}-{MAX_MI
 - count elapsed working time, not calendar waiting; count only work still remaining. For Reject, estimate the work if it were done anyway."""
 
 
+def batch_project(batch):
+    return proj(batch[0]["issue"])
+
+
+def mirror_dirs(project):
+    return [os.path.join(MIRRORS, r) for r in project.repos]
+
+
 def prompt_head(batch):
     lst = "\n".join(f"- {w['issue']['key']}: read ./{w['context']}" for w in batch)
-    repos = ", ".join(os.path.join(MIRRORS, r) for r in REPOS)
+    repos = ", ".join(mirror_dirs(batch_project(batch)))
     return (f"Your working directory holds one file per issue with its GitHub data (body, comments, labels, "
             f"sub-issues, related commits, candidate related issues). The repositories are cloned at {repos}. "
             f"You can only read files; that is all this task needs.\n\n{SECURITY}\n\nIssues:\n{lst}\n\n")
 
 
 def prompt_full(batch):
-    return (f"You are triaging {len(batch)} GitHub issues of the owner {OWNER}. {prompt_head(batch)}"
-            f"1) {EFFORT_RULES}\n\n2) Classification and next step:\n{RULES}\n\n3) {RELATED_RULES}\n\n"
-            f"4) Triage record:\n{RECORD}\n\n"
+    project = batch_project(batch)
+    return (f"You are triaging {len(batch)} GitHub issues of the owner {project.owner}. {prompt_head(batch)}"
+            f"1) {EFFORT_RULES}\n\n2) Classification and next step:\n{rules(project)}\n\n3) {RELATED_RULES}\n\n"
+            f"4) Triage record:\n{RECORD.format(owner=project.owner)}\n\n"
             "Return exactly one entry per listed issue with all fields of the schema (empty lists where nothing applies).")
 
 
 def prompt_relations(batch):
-    return (f"You are linking related issues for {len(batch)} open GitHub issues of the owner {OWNER}; they were "
+    return (f"You are linking related issues for {len(batch)} open GitHub issues of the owner "
+            f"{batch_project(batch).owner}; they were "
             f"triaged before, so do nothing else. {prompt_head(batch)}{RELATED_RULES}\n\n"
             "Return exactly one entry per listed issue (an empty related list when none qualify).")
 
 
 def prompt_closed(batch):
-    return (f"You are recording {len(batch)} CLOSED GitHub issues of the owner {OWNER} for later search and analysis; "
+    return (f"You are recording {len(batch)} CLOSED GitHub issues of the owner {batch_project(batch).owner} "
+            "for later search and analysis; "
             f"no further work will be done on them. {prompt_head(batch)}"
             "For each issue return:\n"
             "- summary: what the issue was about (2-3 sentences);\n"
@@ -506,7 +675,7 @@ def prompt_closed(batch):
 _S, _A = {"type": "string"}, {"type": "array", "items": {"type": "string"}}
 _RELATED = {"type": "array", "items": {"type": "object", "properties": {
     "repo": _S, "issue": {"type": "integer"}, "reason": _S}, "required": ["repo", "issue", "reason"]}}
-_TYPE = {"type": "string", "enum": list(TYPE_IDS)}
+_TYPE = {"type": "string", "enum": list(ISSUE_TYPES)}
 _KEY = {"repo": _S, "issue": {"type": "integer"}}
 FIELDS_FULL = {**_KEY, "summary": _S, "current_state": _S, "prior_decisions": _A,
                "minutes": {"type": "integer", "minimum": MIN_MINUTES, "maximum": MAX_MINUTES}, "estimate_basis": _S,
@@ -533,7 +702,7 @@ def ask_model(mode, batch, batch_dir, spend):
     m = MODES[mode]
     cmd = ["claude", "-p", m.prompt(batch), "--model", MODEL, "--effort", EFFORT, "--restricted",
            "--tools", "Read,Grep,Glob", "--allowedTools", "Read,Grep,Glob",
-           "--add-dir", *[os.path.join(MIRRORS, r) for r in REPOS], "--strict-mcp-config",
+           "--add-dir", *mirror_dirs(batch_project(batch)), "--strict-mcp-config",
            "--disable-slash-commands", "--no-session-persistence", "--max-turns", "120",
            "--max-budget-usd", str(MODEL_CALL_USD), "--output-format", "json", "--json-schema", schema(m.fields)]
     try:
@@ -682,24 +851,34 @@ def plain(text, limit=60):
 # writing to GitHub
 
 def issues_api(issue, *parts):
-    return "/".join([f"repos/{OWNER}/{issue['repo']}/issues", *map(str, parts)])
+    return "/".join([f"repos/{proj(issue).owner}/{issue['repo']}/issues", *map(str, parts)])
 
 
-def set_field(item, field, number=None, option=None):
-    val = ["--number", str(number)] if number is not None else ["--single-select-option-id", option]
-    gh("project", "item-edit", "--project-id", PROJECT_ID, "--id", item, "--field-id", field, *val)
+def set_field(issue, field, number=None, option=None):
+    """Write the project field named field on the issue's item: a number, or the option named option."""
+    p = proj(issue)
+    val = ["--number", str(number)] if number is not None else ["--single-select-option-id", p.option(field, option)]
+    gh("project", "item-edit", "--project-id", p.id, "--id", issue["item"], "--field-id", p.field(field), *val)
 
 
-def clear_field(item, field):
+def clear_field(issue, field):
+    p = proj(issue)
     gql("mutation($p:ID!,$i:ID!,$f:ID!){clearProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f})"
-        "{projectV2Item{id}}}", p=PROJECT_ID, i=item, f=field)
+        "{projectV2Item{id}}}", p=p.id, i=issue["item"], f=p.field(field))
 
 
 def find_comment(issue, mark):
-    """The newest comment by the owner that starts with mark: (id, body), or None."""
+    """The newest comment that starts with mark, written by anyone working on the repository (owner, member,
+    collaborator: the work may pass between them), as (id, body), or None. Outside authors' comments never
+    count, so a public comment cannot pose as a record the script would read or overwrite."""
     out = gh("api", "--paginate", issues_api(issue, issue["number"], "comments"), "--jq",
-             f'.[] | select(.user.login == "{OWNER}" and (.body | startswith("{mark}"))) | {{id, body}} | @json')
-    found = [json.loads(line) for line in out.splitlines() if line.strip()]
+             ".[] | {id, body, author_association} | @json")
+    return newest_record([json.loads(line) for line in out.splitlines() if line.strip()], mark)
+
+
+def newest_record(comments, mark):
+    found = [c for c in comments
+             if c.get("author_association") in TRUSTED_AUTHORS and (c.get("body") or "").startswith(mark)]
     return (found[-1]["id"], found[-1]["body"].replace("\r\n", "\n")) if found else None
 
 
@@ -762,7 +941,7 @@ def link_related(issue, picks, dry, changes):
 
 
 def plan_labels(issue, r):
-    allowed = REPO_LABELS[issue["repo"]]
+    allowed = proj(issue).labels(issue["repo"])
     add = sorted({l for l in r["labels_add"] if l in allowed} - set(issue["labels"]))
     rem = sorted({l for l in r["labels_remove"] if l in allowed} & set(issue["labels"]))
     if "idea" in add and issue["status"] not in IDEA_ALLOWED_STATUSES:
@@ -781,7 +960,7 @@ def apply_labels(issue, add, rem, dry, changes):
     for l in rem:
         if not dry:
             try:
-                gh("api", "-X", "DELETE", f"{path}/{l}")
+                gh("api", "-X", "DELETE", f"{path}/{quote(l, safe='')}")
             except RuntimeError as e:
                 if "404" not in str(e):        # already gone
                     raise
@@ -791,7 +970,7 @@ def apply_labels(issue, add, rem, dry, changes):
 
 def set_status(issue, status, dry, changes, why=""):
     if not dry:
-        set_field(issue["item"], F_STATUS, option=OPT_STATUS[status])
+        set_field(issue, "Status", option=status)
     changes.append(f"Status {issue['status'] or 'none'}->{status}{why}")
     issue["status"] = status
 
@@ -800,12 +979,13 @@ def ensure_item(issue, dry, empty_status, changes):
     if not issue["item"]:
         if not dry:
             issue["item"] = gql("mutation($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c})"
-                                "{item{id}}}", p=PROJECT_ID, c=issue["id"])["addProjectV2ItemById"]["item"]["id"]
+                                "{item{id}}}", p=proj(issue).id, c=issue["id"])["addProjectV2ItemById"]["item"]["id"]
         changes.append("added to project")
-    if not issue["product"]:
+    product = proj(issue).product(issue["repo"])
+    if product and not issue["product"]:
         if not dry:
-            set_field(issue["item"], F_PRODUCT, option=OPT_PRODUCT[REPOS[issue["repo"]]])
-        changes.append(f"Product={REPOS[issue['repo']]}")
+            set_field(issue, "Product", option=product)
+        changes.append(f"Product={product}")
     if not issue["status"] and empty_status:
         set_status(issue, empty_status, dry, changes)
 
@@ -814,7 +994,7 @@ def set_type(issue, r, dry, changes):
     if r["type"] != issue["type"]:
         if not dry:
             gql("mutation($i:ID!,$t:ID!){updateIssueIssueType(input:{issueId:$i,issueTypeId:$t}){issue{id}}}",
-                i=issue["id"], t=TYPE_IDS[r["type"]])
+                i=issue["id"], t=proj(issue).types[r["type"]])
         changes.append(f"type {issue['type'] or 'none'}->{r['type']}")
 
 
@@ -839,7 +1019,7 @@ def publish(issue, mark, body, rec, changes, dry, final_fields):
     changes.append(f"{kind} comment {upsert_comment(issue, mark, body)}")
     write_ledger(rec, changes)
     for field, value in final_fields:
-        set_field(issue["item"], field, **value)
+        set_field(issue, field, **value)
     return changes
 
 
@@ -865,7 +1045,7 @@ def apply_full(issue, r, cands, dry, rec):
         step = "Triage" if issue["estimate"] is None else "Triage (again)"
         add_estimate_row(issue, estimate_row(today_cz(), step, r["minutes"], issue["estimate"], r["estimate_basis"]))
     return publish(issue, TRIAGE_MARK, body, rec, changes, dry,
-                   [(F_ESTIMATE, {"number": r["minutes"]}), (F_NEXT, {"option": OPT_NEXT[r["next_step"]]})])
+                   [("Estimate", {"number": r["minutes"]}), ("Next step", {"option": r["next_step"]})])
 
 
 def apply_relations(issue, r, cands, dry, rec):
@@ -893,7 +1073,7 @@ def apply_closed(issue, r, cands, dry, rec):
     linked = link_related(issue, picks, dry, changes)
     changes.append("Next step=Done")
     body = render_closed(issue, r, changes, related_lines(linked, issue["related"]))
-    return publish(issue, CLOSED_MARK, body, rec, changes, dry, [(F_NEXT, {"option": OPT_NEXT["Done"]})])
+    return publish(issue, CLOSED_MARK, body, rec, changes, dry, [("Next step", {"option": "Done"})])
 
 
 Mode = namedtuple("Mode", "batch fields prompt apply stage has_type")
@@ -905,7 +1085,7 @@ MODES = {   # also the order of work within a run
 
 
 def validate(mode, r):
-    if MODES[mode].has_type and r.get("type") not in TYPE_IDS:
+    if MODES[mode].has_type and r.get("type") not in ISSUE_TYPES:
         raise RuntimeError(f"invalid type from the model: {r.get('type')}")
     if mode == "full":
         if r.get("next_step") not in OPEN_STEPS:
@@ -979,9 +1159,9 @@ def run_umbrellas(index, dry, report, notices, state):
                 write_ledger(dict(ts=now_iso(), stage="umbrella", repo=issue["repo"], issue=issue["number"],
                                   title=issue["title"], status=issue["status"], minutes=new_est, basis=basis), changes)
                 if est_changed:
-                    set_field(issue["item"], F_ESTIMATE, number=new_est)
+                    set_field(issue, "Estimate", number=new_est)
                 if issue["next_step"]:
-                    clear_field(issue["item"], F_NEXT)
+                    clear_field(issue, "Next step")
             report.append(f"{key} [umbrella] {plain(issue['title'])}: {'; '.join(changes)}")
         except Outage:
             raise
@@ -1004,6 +1184,8 @@ def load_state():
         state["fails"] = {}
     state.setdefault("outage_runs", 0)
     state.setdefault("relations_checked", {})
+    if not isinstance(state.get("config_noticed"), dict):
+        state["config_noticed"] = {}
     if not isinstance(state.get("spend"), dict):
         state["spend"] = {}
     return state
@@ -1040,15 +1222,51 @@ def count_fail(state, key, err, notices):
 
 # main
 
+def notice_once(state, key, problem, message, notices):
+    """Tell the owner about a configuration problem once, again only when it changes; problem None = fixed."""
+    noticed = state["config_noticed"]
+    if problem is None:
+        noticed.pop(key, None)
+        return
+    log(message)
+    if noticed.get(key) != problem:
+        notices.append(plain(message, 400))
+    noticed[key] = problem
+
+
+def configure(path, state, notices):
+    """Load the configuration and use the projects discovery accepts; ConfigError when none can run."""
+    try:
+        projects = load_config(path)
+    except ConfigError as e:
+        notice_once(state, "config", str(e), f"Triage not run: {e}", notices)
+        raise
+    notice_once(state, "config", None, "", notices)
+    accepted = []
+    for project in projects:
+        try:
+            discover(project)
+        except ConfigError as e:
+            notice_once(state, str(project), str(e), f"Project {project} skipped: {e}", notices)
+            continue
+        notice_once(state, str(project), None, "", notices)
+        accepted.append(project)
+    use_projects(accepted)
+    if not accepted:
+        raise ConfigError("no configured project can run")
+
+
 def make_batches(work):
-    """One mode per batch; outside threads alone; each batch directory holds only its own context files."""
+    """One mode and one project per batch; outside threads alone; each batch directory holds only its own
+    context files."""
     shutil.rmtree(CONTEXT, ignore_errors=True)
     groups = []
     for mode, m in MODES.items():
-        own = [w for w in work if w["mode"] == mode]
-        trusted = [w for w in own if w["issue"]["trusted"]]
-        groups += [(mode, trusted[i:i + m.batch]) for i in range(0, len(trusted), m.batch)]
-        groups += [(mode, [w]) for w in own if not w["issue"]["trusted"]]
+        for project in PROJECTS:
+            own = [w for w in work if w["mode"] == mode and proj(w["issue"]) is project]
+            trusted = [w for w in own if w["issue"]["trusted"]]
+            groups += [(mode, trusted[i:i + m.batch]) for i in range(0, len(trusted), m.batch)]
+            groups += [(mode, [w]) for w in own if not w["issue"]["trusted"]]
     batches = []
     for i, (mode, group) in enumerate(groups):
         batch_dir = os.path.join(CONTEXT, f"batch-{i}")
@@ -1066,6 +1284,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="write nothing to GitHub, the ledger or state.json")
     ap.add_argument("--only", nargs="*", help="repo#N to (re)triage regardless of fields")
     ap.add_argument("--mode", choices=list(MODES), help="with --only: force this mode")
+    ap.add_argument("--config", default=CONFIG, help=f"configuration file (default {CONFIG})")
     args = ap.parse_args()
     if args.mode and not args.only:
         ap.error("--mode needs --only")
@@ -1125,6 +1344,7 @@ def main():
 
     work = []
     try:
+        configure(args.config, state, notices)
         index = list_index()
         if not args.only:
             run_umbrellas(index, args.dry_run, report, notices, state)
@@ -1133,7 +1353,7 @@ def main():
             keys = []
             for x in args.only:
                 repo, _, n = x.partition("#")
-                if repo in REPOS and n.isdigit():
+                if repo in REPO_PROJECT and n.isdigit():
                     keys.append((args.mode, repo, int(n)))
                 else:
                     notices.append(f"--only {plain(x)}: not repo#N of a watched repository")
@@ -1185,6 +1405,8 @@ def main():
                     state["relations_checked"][key] = now_iso()
                 continue
             work.append(dict(issue=issue, mode=mode, cands=cands, complete=complete))
+    except ConfigError:
+        return finish()            # configure() has noticed it
     except RuntimeError as e:
         outage(e, "loading issues")
         return finish()

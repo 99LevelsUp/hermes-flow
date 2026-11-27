@@ -1,0 +1,34 @@
+{
+  "projects": [
+    {
+      "owner": "99LevelsUp",
+      "number": 3,
+      "repos": {
+        "ev3-c": {
+          "product": "EVƎ C",
+          "labels": {
+            "needs-brick": "completing the issue requires a real EV3 brick (hardware verification or measurement).",
+            "education": "teaching materials and learner experience; only when the issue is clearly about that.",
+            "accessibility": "a barrier affecting people with disabilities; only when the issue is clearly about that.",
+            "backlog": "an idea kept for later, outside the current stage; only when the issue is clearly that."
+          }
+        },
+        "ev3-cockpit": {
+          "product": "EVƎ Cockpit",
+          "labels": {
+            "needs-brick": "completing the issue requires a real EV3 brick (hardware verification or measurement)."
+          }
+        }
+      }
+    },
+    {
+      "owner": "99LevelsUp",
+      "number": 4,
+      "repos": {
+        "hermes-flow": {
+          "product": "Hermes flow"
+        }
+      }
+    }
+  ]
+}
