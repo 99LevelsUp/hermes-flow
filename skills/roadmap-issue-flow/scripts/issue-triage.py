@@ -54,9 +54,9 @@ BASE_LABELS = {
                         "is unambiguous, no owner decision is pending, no hardware or human judgement is needed, and "
                         "the change is small and self-contained. Remove it when that no longer holds.",
 }
-AGENT_ALONE = "good first issue"
-# labels that mean a human is needed; an issue carrying one cannot be solved by an agent alone
-NEEDS_HUMAN = ("needs-brick", "needs-prototype", "needs-bakeoff", "help wanted")
+# good first issue = an agent alone can solve it; never with a label that needs a human, a next step that
+# needs the owner, or a pending owner decision
+NEEDS_HUMAN = frozenset({"needs-brick", "needs-prototype", "needs-bakeoff", "help wanted"})
 NEEDS_HUMAN_STEPS = ("Ideate", "Decide", "Reject")
 FLAG_LABELS = {      # flags, independent of the next step
     "needs-prototype": "the main open question is how something should behave, look or read, and only a throwaway "
@@ -947,16 +947,29 @@ def link_related(issue, picks, dry, changes):
     return linked
 
 
-def plan_labels(issue, r):
+def plan_labels(issue, r, decision_pending=False):
+    """Labels to add and remove. decision_pending: the issue waits for the owner (e.g. an outside idea)."""
     allowed = proj(issue).labels(issue["repo"])
     add = {l for l in r["labels_add"] if l in allowed} - set(issue["labels"])
     rem = {l for l in r["labels_remove"] if l in allowed} & set(issue["labels"])
     after = (set(issue["labels"]) | add) - rem
-    if AGENT_ALONE in allowed and (r["next_step"] in NEEDS_HUMAN_STEPS or after & set(NEEDS_HUMAN)):
-        add.discard(AGENT_ALONE)                   # a human is needed: never "an agent alone can solve it"
-        if AGENT_ALONE in issue["labels"]:
-            rem.add(AGENT_ALONE)
+    if (decision_pending or issue["status"] in (NEEDS_DECISION, REJECT_PROPOSED)
+            or r["next_step"] in NEEDS_HUMAN_STEPS or after & NEEDS_HUMAN):
+        add.discard("good first issue")
+        if "good first issue" in issue["labels"]:
+            rem.add("good first issue")
     return sorted(add), sorted(rem)
+
+
+_repo_labels = {}
+
+
+def repo_labels(repo):
+    """Names of the labels that exist in repo, read once per run."""
+    if repo not in _repo_labels:
+        out = gh("api", "--paginate", f"repos/{proj(repo).owner}/{repo}/labels", "--jq", ".[].name")
+        _repo_labels[repo] = set(out.splitlines())
+    return _repo_labels[repo]
 
 
 def label_contradictions(labels, issue_type, next_step):
@@ -972,6 +985,16 @@ def label_contradictions(labels, issue_type, next_step):
     if "question" in labels and next_step != "Decide":
         found.append(f"label question, but the next step is {next_step}, not Decide")
     return found
+
+
+def existing_only(issue, add):
+    """(labels of add that exist in the repo, the missing ones). Adding a missing label would create it, and
+    labels belong to the repository setup, never to triage."""
+    have = repo_labels(issue["repo"])
+    missing = [l for l in add if l not in have]
+    if missing:
+        log(f"{issue['key']}: label(s) {', '.join(missing)} missing in {issue['repo']}; not added")
+    return [l for l in add if l in have], missing
 
 
 def apply_labels(issue, add, rem, dry, changes):
@@ -1050,13 +1073,16 @@ def apply_full(issue, r, cands, dry, rec):
     picks = pick_related(cands, r, issue["related"])
     outside_idea = not issue["author_trusted"] and r["type"] != "Bug" and r["next_step"] != "Reject"
     note = OUTSIDE_IDEA_NOTE if outside_idea else ""
-    add, rem = plan_labels(issue, r)
+    add, rem = plan_labels(issue, r, decision_pending=outside_idea)
+    add, missing = existing_only(issue, add)
     labels_now = sorted((set(issue["labels"]) | set(add)) - set(rem))
     render_full(issue, r, labels_now, ["draft"], related_lines(picks, issue["related"]), note)   # fails before any write
     changes = []
     ensure_item(issue, dry, BACKLOG, changes)
     set_type(issue, r, dry, changes)
     apply_labels(issue, add, rem, dry, changes)
+    if missing:
+        changes.append(f"label missing in the repository, not added: {', '.join(missing)}")
     linked = link_related(issue, picks, dry, changes)
     if issue["status"] == BACKLOG and r["next_step"] == "Reject":
         set_status(issue, REJECT_PROPOSED, dry, changes)

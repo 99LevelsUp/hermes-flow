@@ -11,7 +11,7 @@ Format: step | Status | what | CE tools | GitHub tools | result.
 
 2. Idea becomes an issue | Backlog | every idea surviving ideation is one issue
    CE: ce-ideate generates and scores ideas; each survivor gets an issue
-   GH: gh issue create (English, ## What / ## Why, Source: line); gh issue list --search for duplicates (similar = comment); Auto-add puts it on board as Backlog; issue type Bug/Feature/Task (GitHub default labels are left alone; contradictions are reported by triage); labels documentation, security, needs-brick
+   GH: gh issue create (English, ## What / ## Why, Source: line); gh issue list --search for duplicates (similar = comment); Auto-add puts it on board as Backlog; issue type Bug/Feature/Task (GitHub default labels are left alone; contradictions are reported by triage); labels documentation, security, needs-brick; triage may set or remove good first issue (an agent alone can solve it)
 
 3. Triage and priority | Backlog (outside ideas -> Needs decision; Reject -> Reject proposed) | owner orders the queue; Priority decides what is brainstormed next
    Automated part (cron issue-triage, see SKILL.md): first Estimate (minutes) + estimate-history row, issue type, labels, relates-to links, Next step (Ideate / Brainstorm / Decide / Debug / Reject; Done for closed issues), flags needs-prototype / needs-bakeoff, and a triage record comment for the next agent; umbrellas get Estimate = sum and Status = least advanced sub-issue.
