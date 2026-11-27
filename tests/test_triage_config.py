@@ -235,8 +235,8 @@ class EvreRoadmapUnchanged(unittest.TestCase):
 
     def test_labels_and_products(self):
         p = next(p for p in t.load_config(REPO_CONFIG) if (p.owner, p.number) == ("99LevelsUp", 3))
-        common = {"idea", "needs-brick", "documentation", "needs-prototype", "needs-bakeoff"}
-        self.assertEqual(set(p.labels("ev3-c")), common | {"education", "accessibility", "backlog"})
+        common = {"needs-brick", "documentation", "security", "good first issue", "needs-prototype", "needs-bakeoff"}
+        self.assertEqual(set(p.labels("ev3-c")), common | {"education", "accessibility"})
         self.assertEqual(set(p.labels("ev3-cockpit")), common)
         self.assertEqual({r: c.get("product") for r, c in p.repos.items()},
                          {"ev3-c": "EVƎ C", "ev3-cockpit": "EVƎ Cockpit"})
@@ -250,6 +250,96 @@ class Records(unittest.TestCase):
                     {"id": 4, "body": "<!-- other -->", "author_association": "OWNER"}]
         self.assertEqual(t.newest_record(comments, "<!-- m -->"), (2, "<!-- m -->taken over"))
         self.assertIsNone(t.newest_record(comments[2:], "<!-- m -->"))
+
+
+class Labels(unittest.TestCase):
+    def setUp(self):
+        t.use_projects([t.Project("o", 1, {"a": {"labels": {"needs-brick": "hardware"}}})])
+
+    def tearDown(self):
+        t.use_projects([])
+
+    def plan(self, labels, add=(), remove=(), next_step="Brainstorm", status="Backlog", pending=False):
+        issue = {"repo": "a", "labels": list(labels), "status": status}
+        return t.plan_labels(issue, {"labels_add": list(add), "labels_remove": list(remove), "next_step": next_step},
+                             decision_pending=pending)
+
+    def test_agent_alone_when_nothing_needs_a_human(self):
+        self.assertEqual(self.plan([], ["good first issue"]), (["good first issue"], []))
+
+    def test_never_agent_alone_when_a_human_is_needed(self):
+        gfi = ["good first issue"]
+        for labels, add, kw in (([], gfi, {"next_step": "Decide"}), ([], gfi, {"next_step": "Ideate"}),
+                                ([], gfi, {"next_step": "Reject"}),
+                                ([], gfi + ["needs-brick"], {}),
+                                (["needs-prototype"], gfi, {}), (["needs-bakeoff"], gfi, {}),
+                                (["help wanted"], gfi, {}),
+                                ([], gfi, {"status": "Needs decision"}), ([], gfi, {"status": "Reject proposed"}),
+                                ([], gfi, {"pending": True})):
+            with self.subTest(labels=labels, add=add, kw=kw):
+                self.assertNotIn("good first issue", self.plan(labels, add, **kw)[0])
+
+    def test_agent_alone_removed_when_it_no_longer_holds(self):
+        self.assertEqual(self.plan(["good first issue"], ["needs-brick"]), (["needs-brick"], ["good first issue"]))
+        self.assertEqual(self.plan(["good first issue"], next_step="Decide"), ([], ["good first issue"]))
+
+    def test_idea_and_defaults_are_left_alone(self):
+        self.assertEqual(self.plan(["idea", "bug"], ["idea", "wontfix"], ["idea", "bug"]), ([], []))
+
+    def test_missing_labels_are_never_created(self):
+        calls = []
+
+        def gh(*a, **k):
+            calls.append(a)
+            return "security\ndocumentation\n"
+        t._repo_labels.clear()
+        with mock.patch.object(t, "gh", gh), mock.patch.object(t, "log", lambda m: None):
+            issue = {"repo": "a", "key": "a#1"}
+            self.assertEqual(t.existing_only(issue, ["good first issue", "security"]),
+                             (["security"], ["good first issue"]))
+            t.existing_only(issue, ["documentation"])
+        self.assertEqual(len(calls), 1)            # read once per run
+        t._repo_labels.clear()
+
+    def test_record_lists_contradictions(self):
+        r = {"summary": "s", "current_state": "c", "prior_decisions": [], "next_step": "Brainstorm",
+             "next_step_reason": "x", "minutes": 60, "estimate_basis": "b", "type": "Feature", "type_reason": "t",
+             "labels_reason": "l", "alternatives": [], "problem_count": 1, "problems": [], "evidence": [],
+             "open_questions": []}
+        body = t.render_full({"trusted": True}, r, ["bug"], [], [], "")
+        self.assertIn("### Label contradictions (reported only; the owner decides)\n\n"
+                      "- label bug, but the issue type is Feature", body)
+
+    def test_prompt_leaves_default_labels_to_the_owner(self):
+        text = t.rules(t.proj("a"))
+        self.assertIn("GitHub's default labels", text)
+        self.assertIn("- good first issue:", text)
+        self.assertNotIn("- idea", text)
+
+    def test_outside_idea_never_gets_good_first_issue(self):
+        r = {"summary": "s", "current_state": "c", "prior_decisions": [], "next_step": "Brainstorm",
+             "next_step_reason": "x", "minutes": 60, "estimate_basis": "b", "type": "Feature", "type_reason": "t",
+             "labels_add": ["good first issue", "security"], "labels_remove": [], "labels_reason": "l",
+             "alternatives": [], "problem_count": 1, "problems": [], "evidence": [], "open_questions": [],
+             "related": []}
+        issue = {"repo": "a", "key": "a#1", "number": 1, "labels": [], "status": "Backlog", "item": "I",
+                 "product": "x", "type": "Feature", "related": set(), "trusted": False, "author_trusted": False,
+                 "estimate": None, "title": "t"}
+        with mock.patch.object(t, "repo_labels", lambda repo: {"good first issue", "security"}):
+            changes = t.apply_full(dict(issue), r, {}, True, {})
+            self.assertIn("+security", changes)
+            self.assertFalse(any("good first issue" in c for c in changes))
+            changes = t.apply_full(dict(issue, author_trusted=True, trusted=True), r, {}, True, {})
+            self.assertIn("+good first issue,security", changes)
+
+    def test_contradictions(self):
+        self.assertEqual(t.label_contradictions(["bug", "question"], "Feature", "Brainstorm"),
+                         ["label bug, but the issue type is Feature",
+                          "label question, but the next step is Brainstorm, not Decide"])
+        self.assertEqual(t.label_contradictions(["enhancement", "duplicate"], "Bug", "Debug"),
+                         ["label enhancement, but the issue type is Bug",
+                          "label duplicate, but the next step is Debug, not Reject"])
+        self.assertEqual(t.label_contradictions(["bug", "wontfix"], "Bug", "Reject"), [])
 
 
 class TwoProjects(unittest.TestCase):
@@ -294,10 +384,11 @@ class TwoProjects(unittest.TestCase):
     def test_labels_per_repository(self):
         self.assertIn("hw", t.proj("a").labels("a"))
         self.assertNotIn("hw", t.proj("b").labels("b"))
-        self.assertIn("idea", t.proj("c").labels("c"))
+        self.assertIn("security", t.proj("c").labels("c"))
         issue = {"repo": "b", "labels": [], "status": "Backlog"}
-        add, _ = t.plan_labels(issue, {"labels_add": ["hw", "idea"], "labels_remove": []})
-        self.assertEqual(add, ["idea"])
+        add, _ = t.plan_labels(issue, {"labels_add": ["hw", "security", "idea", "bug"], "labels_remove": [],
+                                       "next_step": "Brainstorm"})
+        self.assertEqual(add, ["security"])     # hw belongs to repo a; idea is gone; defaults are not ours
 
     def test_label_rules_name_the_repository(self):
         text = t.label_rules(self.p1)

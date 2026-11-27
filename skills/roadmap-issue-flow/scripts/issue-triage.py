@@ -47,10 +47,17 @@ ISSUE_TYPES = ("Bug", "Feature", "Task")
 REQUIRED_FIELDS = {"Status": (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED, READY, IN_PROGRESS, DONE),
                    "Estimate": None, "Next step": (*OPEN_STEPS, "Done")}
 BASE_LABELS = {
-    "idea": "the issue has not yet passed the gate to Ready (brainstorm + document review). A Backlog issue that "
-            "is still a raw idea keeps it.",
     "documentation": "the work is mainly documentation.",
+    "security": "the issue concerns a security impact (a vulnerability, a hardening, secrets, permissions, untrusted "
+                "input).",
+    "good first issue": "an AI agent can solve the issue without human supervision: ONE concrete problem, the spec "
+                        "is unambiguous, no owner decision is pending, no hardware or human judgement is needed, and "
+                        "the change is small and self-contained. Remove it when that no longer holds.",
 }
+# good first issue = an agent alone can solve it; never with a label that needs a human, a next step that
+# needs the owner, or a pending owner decision
+NEEDS_HUMAN = frozenset({"needs-brick", "needs-prototype", "needs-bakeoff", "help wanted"})
+NEEDS_HUMAN_STEPS = ("Ideate", "Decide", "Reject")
 FLAG_LABELS = {      # flags, independent of the next step
     "needs-prototype": "the main open question is how something should behave, look or read, and only a throwaway "
                        "prototype tried by a human settles it (UI, displays, UX flows).",
@@ -58,8 +65,6 @@ FLAG_LABELS = {      # flags, independent of the next step
                      "comparing them is worth it (typically architecture).",
 }
 COMMON_LABELS = {**BASE_LABELS, **FLAG_LABELS}
-IDEA_ALLOWED_STATUSES = (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED)
-IDEA_FORBIDDEN_STATUSES = (READY, IN_PROGRESS, DONE)
 TRUSTED_AUTHORS = ("OWNER", "MEMBER", "COLLABORATOR")
 MIN_MINUTES, MAX_MINUTES = 5, 20000
 
@@ -587,7 +592,7 @@ def label_rules(project):
 def rules(project):
     return f"""Classification rules (the owner's process):
 - Issue type (GitHub issue type), exactly one: {TYPE_RULES}.
-- The kind of work is expressed ONLY by the issue type. There are no labels bug, enhancement or task; never propose them.
+- The kind of work is expressed ONLY by the issue type. GitHub's default labels (bug, enhancement, duplicate, invalid, question, wontfix, help wanted) are not yours to set or remove; the script reports where they contradict your result.
 - Labels you may add or remove are listed below (each only in the repositories named); leave all other labels alone.
 {label_rules(project)}
 
@@ -809,6 +814,8 @@ def render_full(issue, r, labels_now, changes, related, note):
         f"| Estimate | {r['minutes']} min | {cell(r['estimate_basis'])} |\n"
         f"| Type | {r['type']} | {cell(r['type_reason'])} |\n"
         f"| Labels | {', '.join(labels_now) or 'none'} | {cell(r['labels_reason'])} |",
+        "### Label contradictions (reported only; the owner decides)",
+        bullets(label_contradictions(labels_now, r["type"], r["next_step"])),
         "### Alternatives", alts,
         f"### Separate problems ({int(r['problem_count'])})", bullets(neutralise_list(r["problems"]), "one problem"),
         "### Related issues", bullets(related),
@@ -940,15 +947,54 @@ def link_related(issue, picks, dry, changes):
     return linked
 
 
-def plan_labels(issue, r):
+def plan_labels(issue, r, decision_pending=False):
+    """Labels to add and remove. decision_pending: the issue waits for the owner (e.g. an outside idea)."""
     allowed = proj(issue).labels(issue["repo"])
-    add = sorted({l for l in r["labels_add"] if l in allowed} - set(issue["labels"]))
-    rem = sorted({l for l in r["labels_remove"] if l in allowed} & set(issue["labels"]))
-    if "idea" in add and issue["status"] not in IDEA_ALLOWED_STATUSES:
-        add.remove("idea")
-    if issue["status"] in IDEA_FORBIDDEN_STATUSES and "idea" in issue["labels"] and "idea" not in rem:
-        rem.append("idea")
-    return add, rem
+    add = {l for l in r["labels_add"] if l in allowed} - set(issue["labels"])
+    rem = {l for l in r["labels_remove"] if l in allowed} & set(issue["labels"])
+    after = (set(issue["labels"]) | add) - rem
+    if (decision_pending or issue["status"] in (NEEDS_DECISION, REJECT_PROPOSED)
+            or r["next_step"] in NEEDS_HUMAN_STEPS or after & NEEDS_HUMAN):
+        add.discard("good first issue")
+        if "good first issue" in issue["labels"]:
+            rem.add("good first issue")
+    return sorted(add), sorted(rem)
+
+
+_repo_labels = {}
+
+
+def repo_labels(repo):
+    """Names of the labels that exist in repo, read once per run."""
+    if repo not in _repo_labels:
+        out = gh("api", "--paginate", f"repos/{proj(repo).owner}/{repo}/labels", "--jq", ".[].name")
+        _repo_labels[repo] = set(out.splitlines())
+    return _repo_labels[repo]
+
+
+def label_contradictions(labels, issue_type, next_step):
+    """GitHub default labels that contradict the issue type or the next step; reported, never changed."""
+    found = []
+    if "bug" in labels and issue_type != "Bug":
+        found.append(f"label bug, but the issue type is {issue_type}")
+    if "enhancement" in labels and issue_type == "Bug":
+        found.append("label enhancement, but the issue type is Bug")
+    for label in ("duplicate", "invalid", "wontfix"):
+        if label in labels and next_step != "Reject":
+            found.append(f"label {label}, but the next step is {next_step}, not Reject")
+    if "question" in labels and next_step != "Decide":
+        found.append(f"label question, but the next step is {next_step}, not Decide")
+    return found
+
+
+def existing_only(issue, add):
+    """(labels of add that exist in the repo, the missing ones). Adding a missing label would create it, and
+    labels belong to the repository setup, never to triage."""
+    have = repo_labels(issue["repo"])
+    missing = [l for l in add if l not in have]
+    if missing:
+        log(f"{issue['key']}: label(s) {', '.join(missing)} missing in {issue['repo']}; not added")
+    return [l for l in add if l in have], missing
 
 
 def apply_labels(issue, add, rem, dry, changes):
@@ -1027,13 +1073,16 @@ def apply_full(issue, r, cands, dry, rec):
     picks = pick_related(cands, r, issue["related"])
     outside_idea = not issue["author_trusted"] and r["type"] != "Bug" and r["next_step"] != "Reject"
     note = OUTSIDE_IDEA_NOTE if outside_idea else ""
-    add, rem = plan_labels(issue, r)
+    add, rem = plan_labels(issue, r, decision_pending=outside_idea)
+    add, missing = existing_only(issue, add)
     labels_now = sorted((set(issue["labels"]) | set(add)) - set(rem))
     render_full(issue, r, labels_now, ["draft"], related_lines(picks, issue["related"]), note)   # fails before any write
     changes = []
     ensure_item(issue, dry, BACKLOG, changes)
     set_type(issue, r, dry, changes)
     apply_labels(issue, add, rem, dry, changes)
+    if missing:
+        changes.append(f"label missing in the repository, not added: {', '.join(missing)}")
     linked = link_related(issue, picks, dry, changes)
     if issue["status"] == BACKLOG and r["next_step"] == "Reject":
         set_status(issue, REJECT_PROPOSED, dry, changes)
