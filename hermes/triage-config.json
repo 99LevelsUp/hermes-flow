@@ -20,6 +20,15 @@
           }
         }
       }
+    },
+    {
+      "owner": "99LevelsUp",
+      "number": 4,
+      "repos": {
+        "hermes-flow": {
+          "product": "Hermes flow"
+        }
+      }
     }
   ]
 }
