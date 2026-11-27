@@ -32,14 +32,20 @@ def board(tag, product=("P",), drop_field=None, drop_option=None):
     return {"id": f"{tag}-PROJECT", "fields": {"nodes": [f for f in fields if f["name"] != drop_field]}}
 
 
+NOT_FOUND = "graphql errors: [{'type': 'NOT_FOUND', 'message': 'Could not resolve to a %s'}]"
+
+
 def fake_gql(boards, types=("Bug", "Feature", "Task")):
+    """Answers discovery queries the way GitHub does: something missing is an error, not empty data."""
     def gql(query, retry=True, **v):
         if query is t.DISCOVER_Q:
             b = boards.get((v["owner"], v["n"]))
-            return {"repositoryOwner": {"projectV2": b} if b else None}
+            if not b:
+                raise RuntimeError(NOT_FOUND % "ProjectV2")
+            return {"repositoryOwner": {"projectV2": b}}
         if query is t.TYPES_Q:
             if v["repo"] == "missing":
-                return {"repository": None}
+                raise RuntimeError(NOT_FOUND % "Repository")
             return {"repository": {"issueTypes": {"nodes": [{"id": f"T-{v['owner']}-{n}", "name": n}
                                                              for n in types]}}}
         raise AssertionError(f"unexpected query {query[:40]}")
@@ -95,7 +101,14 @@ class LoadConfig(unittest.TestCase):
                      {"projects": [{"owner": "", "number": 3, "repos": {"a": {}}}]},
                      {"projects": [{"owner": "o", "number": 3, "repos": {}}]},
                      {"projects": [project(repos={"a": {"labels": ["x"]}})]},
-                     {"projects": [project(repos={"a": "x"})]}):
+                     {"projects": [project(repos={"a": "x"})]},
+                     {"projects": [{"owner": "o", "number": True, "repos": {"a": {}}}]},
+                     {"projects": [{"owner": "o", "number": 0, "repos": {"a": {}}}]},
+                     {"projects": [{**project(), "extra": 1}]},
+                     {"projects": [project()], "other": 1},
+                     {"projects": [project(repos={"a": {"label": {}}})]},
+                     {"projects": [project(repos={"a": {"product": ["P"]}})]},
+                     {"projects": [project(repos={"a": {"labels": {"x": ["y"]}}})]}):
             with self.subTest(data=data), self.assertRaises(t.ConfigError):
                 self.load(data)
 
@@ -141,6 +154,15 @@ class Discover(unittest.TestCase):
         with self.assertRaises(t.ConfigError):
             self.discover(board("X"), repos={"a": {}, "missing": {}})
 
+    def test_outage_is_not_a_configuration_error(self):
+        p = t.Project("o", 1, {"a": {}})
+        for err, kind in ((t.Outage("502 bad gateway"), t.Outage), (RuntimeError("graphql errors: boom"), RuntimeError)):
+            def gql(*a, err=err, **k):
+                raise err
+            with self.subTest(err=err), mock.patch.object(t, "gql", gql), self.assertRaises(kind) as cm:
+                t.discover(p)
+            self.assertNotIsInstance(cm.exception, t.ConfigError)
+
     def test_product_is_optional(self):
         p = self.discover(board("X", drop_field="Product"), repos={"a": {}})
         self.assertIsNone(p.product("a"))
@@ -148,6 +170,80 @@ class Discover(unittest.TestCase):
     def test_configured_product_must_exist(self):
         with self.assertRaises(t.ConfigError):
             self.discover(board("X", product=("Other",)))
+
+
+class Configure(unittest.TestCase):
+    """The run-level flow: a bad project is skipped with one notice; the owner hears again only on change."""
+
+    def setUp(self):
+        self.state = {"config_noticed": {}}
+        self.boards = {("o", 1): board("ONE")}
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "config.json")
+
+    def tearDown(self):
+        t.use_projects([])
+        self.dir.cleanup()
+
+    def run_once(self, data):
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+        notices = []
+        try:
+            with mock.patch.object(t, "gql", fake_gql(self.boards)):
+                t.configure(self.path, self.state, notices)
+            return notices, None
+        except t.ConfigError as e:
+            return notices, e
+
+    def test_skipped_project_noticed_once_and_cleared_when_fixed(self):
+        data = {"projects": [project("o", 1, {"a": {}}), project("o", 2, {"b": {}})]}
+        notices, err = self.run_once(data)
+        self.assertIsNone(err)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("o/projects/2 skipped", notices[0])
+        self.assertEqual([str(p) for p in t.PROJECTS], ["o/projects/1"])
+        self.assertEqual(self.run_once(data)[0], [])                   # same problem: silent
+        self.boards[("o", 2)] = board("TWO")
+        notices, _ = self.run_once(data)
+        self.assertEqual((notices, self.state["config_noticed"]), ([], {}))
+        self.assertEqual(len(t.PROJECTS), 2)
+
+    def test_broken_configuration_stops_the_run_with_one_notice(self):
+        notices, err = self.run_once({"projects": []})
+        self.assertIsInstance(err, t.ConfigError)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Triage not run", notices[0])
+        self.assertEqual(self.run_once({"projects": []})[0], [])
+        self.assertEqual(self.run_once({"projects": [project("o", 1)]}), ([], None))
+        self.assertEqual(self.state["config_noticed"], {})
+
+    def test_no_project_can_run(self):
+        notices, err = self.run_once({"projects": [project("o", 9)]})
+        self.assertIsInstance(err, t.ConfigError)
+        self.assertEqual(len(notices), 1)
+
+
+class EvreRoadmapUnchanged(unittest.TestCase):
+    """The repository configuration gives the EVƎ roadmap what the script hard-coded before #31."""
+
+    def test_labels_and_products(self):
+        p = next(p for p in t.load_config(REPO_CONFIG) if (p.owner, p.number) == ("99LevelsUp", 3))
+        common = {"idea", "needs-brick", "documentation", "needs-prototype", "needs-bakeoff"}
+        self.assertEqual(set(p.labels("ev3-c")), common | {"education", "accessibility", "backlog"})
+        self.assertEqual(set(p.labels("ev3-cockpit")), common)
+        self.assertEqual({r: c.get("product") for r, c in p.repos.items()},
+                         {"ev3-c": "EVƎ C", "ev3-cockpit": "EVƎ Cockpit"})
+
+
+class Records(unittest.TestCase):
+    def test_any_collaborator_but_no_outsider(self):
+        comments = [{"id": 1, "body": "<!-- m -->old", "author_association": "OWNER"},
+                    {"id": 2, "body": "<!-- m -->taken over", "author_association": "COLLABORATOR"},
+                    {"id": 3, "body": "<!-- m -->forged", "author_association": "NONE"},
+                    {"id": 4, "body": "<!-- other -->", "author_association": "OWNER"}]
+        self.assertEqual(t.newest_record(comments, "<!-- m -->"), (2, "<!-- m -->taken over"))
+        self.assertIsNone(t.newest_record(comments[2:], "<!-- m -->"))
 
 
 class TwoProjects(unittest.TestCase):
@@ -219,6 +315,23 @@ class TwoProjects(unittest.TestCase):
                 mock.patch.object(t, "write_context", lambda issue, cands, batch_dir: "f"):
             batches = t.make_batches(work)
         self.assertEqual(sorted(sorted(w["issue"]["repo"] for w in b) for _, b, _ in batches), [["a", "b"], ["c"]])
+
+    def test_candidates_stay_within_the_project(self):
+        sibling = {"id": "N", "title": "t", "state": "OPEN", "body": "", "authorAssociation": "OWNER"}
+        parent = {"repository": {"nameWithOwner": "o/a"}, "number": 1, "subIssues": {"nodes": [
+            {**sibling, "number": 2, "repository": {"nameWithOwner": "o/b"}},
+            {**sibling, "number": 3, "repository": {"nameWithOwner": "q/c"}}]}}
+        issue = {"key": t.issue_key("a", 5), "repo": "a", "title": "", "body": "", "related": set(), "subs": [],
+                 "parent": parent, "related_complete": True, "author_trusted": False, "comments": []}
+        with mock.patch.object(t, "hybrid_search", lambda repo, q: []):
+            cands, complete = t.find_candidates(issue)
+        self.assertEqual(list(cands), [t.issue_key("b", 2)])
+
+    def test_label_names_are_encoded_in_the_path(self):
+        calls = []
+        with mock.patch.object(t, "gh", lambda *a, **k: calls.append(a)):
+            t.apply_labels({"repo": "a", "number": 4}, [], ["good first issue"], False, [])
+        self.assertEqual(calls[0][-1], "repos/o/a/issues/4/labels/good%20first%20issue")
 
     def test_prompt_names_the_project_owner_and_mirrors(self):
         batch = [{"issue": {"repo": "c", "key": t.issue_key("c", 1)}, "context": "x.md"}]

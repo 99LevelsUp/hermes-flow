@@ -27,10 +27,13 @@ if [[ -f "$stamp" && $force -eq 0 ]]; then
 	trap 'rm -rf "$tmp"' EXIT
 	git archive "$last" skills/roadmap-issue-flow | tar -x -C "$tmp"
 	config_drift=0
-	# the configuration is deployed since #31; a deploy from before it left none to compare
 	if git cat-file -e "$last:hermes/triage-config.json" 2>/dev/null; then
 		git show "$last:hermes/triage-config.json" >"$tmp/config.json"
 		cmp -s "$tmp/config.json" "$config_live" || config_drift=1
+	elif [[ -e "$config_live" ]] && ! cmp -s hermes/triage-config.json "$config_live"; then
+		# the last deploy installed no configuration, so a live one was written by hand
+		cp /dev/null "$tmp/config.json"
+		config_drift=1
 	fi
 	if ! diff -r -q -x scripts "$tmp/skills/roadmap-issue-flow" "$skill_live" >/dev/null ||
 		! cmp -s "$tmp/skills/roadmap-issue-flow/scripts/issue-triage.py" "$script_live" || ((config_drift)); then

@@ -34,6 +34,7 @@ import argparse, fcntl, json, os, re, shutil, subprocess, sys, time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 BACKLOG, NEEDS_DECISION, REJECT_PROPOSED = "Backlog", "Needs decision", "Reject proposed"
 READY, IN_PROGRESS, DONE = "Ready", "In progress", "Done"
@@ -45,16 +46,18 @@ ISSUE_TYPES = ("Bug", "Feature", "Task")
 # project fields the script needs, with the options it writes (None: not a single-select field)
 REQUIRED_FIELDS = {"Status": (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED, READY, IN_PROGRESS, DONE),
                    "Estimate": None, "Next step": (*OPEN_STEPS, "Done")}
-COMMON_LABELS = {
+BASE_LABELS = {
     "idea": "the issue has not yet passed the gate to Ready (brainstorm + document review). A Backlog issue that "
             "is still a raw idea keeps it.",
     "documentation": "the work is mainly documentation.",
+}
+FLAG_LABELS = {      # flags, independent of the next step
     "needs-prototype": "the main open question is how something should behave, look or read, and only a throwaway "
                        "prototype tried by a human settles it (UI, displays, UX flows).",
     "needs-bakeoff": "the goal is clear but the solution is open, and developing 2-3 competing approaches and "
                      "comparing them is worth it (typically architecture).",
 }
-FLAG_LABELS = ("needs-prototype", "needs-bakeoff")
+COMMON_LABELS = {**BASE_LABELS, **FLAG_LABELS}
 IDEA_ALLOWED_STATUSES = (BACKLOG, NEEDS_DECISION, REJECT_PROPOSED)
 IDEA_FORBIDDEN_STATUSES = (READY, IN_PROGRESS, DONE)
 TRUSTED_AUTHORS = ("OWNER", "MEMBER", "COLLABORATOR")
@@ -121,9 +124,8 @@ class Project:
         return self.options[field][name]
 
     def product(self, repo):
-        """The Product option configured for repo, or None when the project or the repo has none."""
-        name = self.repos[repo].get("product")
-        return name if name and name in self.options.get("Product", {}) else None
+        """The Product option configured for repo, or None."""
+        return self.repos[repo].get("product")     # discover() checked that the option exists
 
     def labels(self, repo):
         """Labels triage may set in repo, with what each means."""
@@ -132,7 +134,6 @@ class Project:
 
 PROJECTS = []           # the configured projects that discovery accepted
 REPO_PROJECT = {}       # repository name -> Project
-VIEWER = [None]         # login of the token's user, who authors the triage comments
 
 
 def load_config(path=CONFIG):
@@ -145,36 +146,56 @@ def load_config(path=CONFIG):
     except (OSError, json.JSONDecodeError) as e:
         raise ConfigError(f"configuration {path} unreadable: {e}") from None
     projects, seen = [], set()
-    listed = data.get("projects") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or set(data) != {"projects"}:
+        raise ConfigError(f"configuration {path} must be an object with the single key 'projects'")
+    listed = data["projects"]
     if not isinstance(listed, list) or not listed:
         raise ConfigError(f"configuration {path} needs a non-empty list 'projects'")
-    for i, p in enumerate(listed):
-        p = p if isinstance(p, dict) else {}
-        owner, number, repos = p.get("owner"), p.get("number"), p.get("repos")
-        if not (isinstance(owner, str) and owner and isinstance(number, int) and isinstance(repos, dict) and repos):
-            raise ConfigError(f"project {i + 1}: needs owner (text), number (integer) and repos (non-empty object)")
+    for i, p in enumerate(listed, 1):
+        if not isinstance(p, dict) or set(p) != {"owner", "number", "repos"}:
+            raise ConfigError(f"project {i}: needs exactly the keys owner, number and repos")
+        owner, number, repos = p["owner"], p["number"], p["repos"]
+        if not (isinstance(owner, str) and owner and type(number) is int and number > 0
+                and isinstance(repos, dict) and repos):
+            raise ConfigError(f"project {i}: owner must be text, number a positive integer, repos a non-empty object")
         for name, repo in repos.items():
             if name in seen:
                 raise ConfigError(f"repository {name} is listed twice; repository names must be unique")
-            if not isinstance(repo, dict) or not isinstance(repo.get("labels", {}), dict):
-                raise ConfigError(f"repository {name}: needs an object, with labels as name -> meaning")
             seen.add(name)
+            if not isinstance(repo, dict) or not set(repo) <= {"product", "labels"}:
+                raise ConfigError(f"repository {name}: an object with the optional keys product and labels")
+            labels = repo.get("labels", {})
+            if not (isinstance(repo.get("product", ""), str) and isinstance(labels, dict)
+                    and all(isinstance(k, str) and k and isinstance(v, str) for k, v in labels.items())):
+                raise ConfigError(f"repository {name}: product must be text and labels map names to meanings (text)")
         projects.append(Project(owner, number, repos))
     return projects
 
 
-DISCOVER_Q = """query($owner:String!,$n:Int!){repositoryOwner(login:$owner){
- ... on User{projectV2(number:$n){%s}} ... on Organization{projectV2(number:$n){%s}}}}"""
-_PROJECT_SEL = ("id fields(first:50){nodes{... on ProjectV2FieldCommon{id name} "
+_PROJECT_SEL = ("id fields(first:100){nodes{... on ProjectV2FieldCommon{id name} "    # boards allow at most 50
                 "... on ProjectV2SingleSelectField{options{id name}}}}")
-DISCOVER_Q = DISCOVER_Q % (_PROJECT_SEL, _PROJECT_SEL)
+DISCOVER_Q = ("query($owner:String!,$n:Int!){repositoryOwner(login:$owner){"
+              f"... on User{{projectV2(number:$n){{{_PROJECT_SEL}}}}} "
+              f"... on Organization{{projectV2(number:$n){{{_PROJECT_SEL}}}}}}}}}")
 TYPES_Q = """query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){
  issueTypes(first:25){nodes{id name}}}}"""
 
 
+def lookup(what, query, **variables):
+    """gql for discovery: a thing GitHub cannot find is a configuration error, not an outage."""
+    try:
+        return gql(query, **variables)
+    except Outage:
+        raise
+    except RuntimeError as e:
+        if "Could not resolve" in str(e) or "NOT_FOUND" in str(e):
+            raise ConfigError(f"{what} not found or not readable with this token") from None
+        raise
+
+
 def discover(project):
     """Fill in the IDs of project; raises ConfigError when something the script writes is missing."""
-    owner = (gql(DISCOVER_Q, owner=project.owner, n=project.number).get("repositoryOwner") or {})
+    owner = lookup(str(project), DISCOVER_Q, owner=project.owner, n=project.number).get("repositoryOwner") or {}
     board = owner.get("projectV2")
     if not board:
         raise ConfigError(f"{project}: project not found or not readable with this token")
@@ -190,8 +211,10 @@ def discover(project):
         missing = [o for o in wanted or () if o not in project.options.get(name, {})]
         if missing:
             raise ConfigError(f"{project}: field '{name}' lacks the options {', '.join(missing)}")
-    for name in project.repos:
-        repository = gql(TYPES_Q, owner=project.owner, repo=name).get("repository")
+    for name, cfg in project.repos.items():
+        if cfg.get("product") and cfg["product"] not in project.options.get("Product", {}):
+            raise ConfigError(f"{project}: Product option '{cfg['product']}' (for {name}) does not exist")
+        repository = lookup(f"{project.owner}/{name}", TYPES_Q, owner=project.owner, repo=name).get("repository")
         if not repository:
             raise ConfigError(f"{project}: repository {project.owner}/{name} not found or not readable")
         types = {t["name"]: t["id"] for t in repository["issueTypes"]["nodes"]}
@@ -201,9 +224,6 @@ def discover(project):
         if project.types and any(project.types[t] != types[t] for t in ISSUE_TYPES):
             raise ConfigError(f"{project}: the repositories have different issue types")
         project.types = types
-    for name, repo in project.repos.items():
-        if repo.get("product") and repo["product"] not in project.options.get("Product", {}):
-            raise ConfigError(f"{project}: Product option '{repo['product']}' (for {name}) does not exist")
 
 
 def use_projects(projects):
@@ -410,15 +430,9 @@ MENTION_RE = re.compile(r"(?:\b([\w.-]+)#|(?<![\w/#])#)(\d{1,6})\b")
 
 def mention_keys(text, own_repo):
     """Issue keys mentioned in text (repo#N or #N), only within own_repo's project, in order, unique."""
-    project = proj(own_repo)
-    keys = []
-    for repo, n in MENTION_RE.findall(text or ""):
-        repo = repo or own_repo
-        if repo in project.repos:
-            key = issue_key(repo, int(n))
-            if key not in keys:
-                keys.append(key)
-    return keys
+    repos = proj(own_repo).repos
+    found = (issue_key(repo or own_repo, int(n)) for repo, n in MENTION_RE.findall(text or ""))
+    return list(dict.fromkeys(k for k in found if k.partition("#")[0] in repos))
 
 
 def query_text(text):
@@ -436,9 +450,9 @@ def hybrid_search(repo, text):
     full = f"{proj(repo).owner}/{repo}"
     out = gh("api", "-X", "GET", "search/issues", "-f", f"q=is:issue repo:{full} {text}",
              "-f", "search_type=hybrid", "-f", f"per_page={SEARCH_RESULTS}", retry=False)
-    want = f"https://api.github.com/repos/{full}"
+    want = f"https://api.github.com/repos/{full}".lower()
     return [it for it in json.loads(out).get("items", [])
-            if it.get("repository_url", "").lower() == want.lower() and "pull_request" not in it]
+            if it.get("repository_url", "").lower() == want and "pull_request" not in it]
 
 
 def find_candidates(issue):
@@ -448,8 +462,10 @@ def find_candidates(issue):
         excluded.add(node_key(issue["parent"]))
     cands, complete = {}, issue["related_complete"]
 
+    own_repos = proj(issue).repos
+
     def add(key, title, state, node_id, body, association, why):
-        if key in excluded:
+        if key in excluded or key.partition("#")[0] not in own_repos:      # links stay within the project
             return
         outside = association not in TRUSTED_AUTHORS
         c = cands.setdefault(key, dict(key=key, title=title, state=state.lower(), id=node_id, outside=outside,
@@ -559,8 +575,7 @@ TYPE_RULES = ("Bug (something that exists behaves wrongly), Feature (new user-vi
 
 def label_rules(project):
     """The labels triage may set in the project's repositories, with their meanings, for the prompt."""
-    common = {name: text for name, text in COMMON_LABELS.items() if name not in FLAG_LABELS}
-    lines = [f"- {name}: {text}" for name, text in common.items()]
+    lines = [f"- {name}: {text}" for name, text in BASE_LABELS.items()]
     extra = {}
     for repo, cfg in project.repos.items():
         for name, text in cfg.get("labels", {}).items():
@@ -583,7 +598,7 @@ Next step (exactly one per issue):
 - Debug (ce-debug): something that exists behaves wrongly; diagnosis comes first.
 - Reject: recommend closing as "not planned" - a duplicate of another open issue, already done, obsolete, contrary to the recorded strategy or decisions (STRATEGY.md, REQUIREMENTS.md, owner's comments), not actionable, not actually a bug, or spam. The owner decides; give the reason and the evidence.
 Flags, independent of the next step, as labels (only when clearly needed):
-""" + "\n".join(f"- {name}: {COMMON_LABELS[name]}" for name in FLAG_LABELS) + """
+""" + "\n".join(f"- {name}: {text}" for name, text in FLAG_LABELS.items()) + """
 Judge from the issue's own text and comments; ignore its current project status when choosing the next step."""
 
 RELATED_RULES = """Related issues (GitHub "relates to" links), chosen ONLY from the candidates listed at the end of the issue's file:
@@ -853,10 +868,17 @@ def clear_field(issue, field):
 
 
 def find_comment(issue, mark):
-    """The newest comment by the token's user that starts with mark: (id, body), or None."""
+    """The newest comment that starts with mark, written by anyone working on the repository (owner, member,
+    collaborator: the work may pass between them), as (id, body), or None. Outside authors' comments never
+    count, so a public comment cannot pose as a record the script would read or overwrite."""
     out = gh("api", "--paginate", issues_api(issue, issue["number"], "comments"), "--jq",
-             f'.[] | select(.user.login == "{VIEWER[0]}" and (.body | startswith("{mark}"))) | {{id, body}} | @json')
-    found = [json.loads(line) for line in out.splitlines() if line.strip()]
+             ".[] | {id, body, author_association} | @json")
+    return newest_record([json.loads(line) for line in out.splitlines() if line.strip()], mark)
+
+
+def newest_record(comments, mark):
+    found = [c for c in comments
+             if c.get("author_association") in TRUSTED_AUTHORS and (c.get("body") or "").startswith(mark)]
     return (found[-1]["id"], found[-1]["body"].replace("\r\n", "\n")) if found else None
 
 
@@ -938,7 +960,7 @@ def apply_labels(issue, add, rem, dry, changes):
     for l in rem:
         if not dry:
             try:
-                gh("api", "-X", "DELETE", f"{path}/{l}")
+                gh("api", "-X", "DELETE", f"{path}/{quote(l, safe='')}")
             except RuntimeError as e:
                 if "404" not in str(e):        # already gone
                     raise
@@ -1162,6 +1184,8 @@ def load_state():
         state["fails"] = {}
     state.setdefault("outage_runs", 0)
     state.setdefault("relations_checked", {})
+    if not isinstance(state.get("config_noticed"), dict):
+        state["config_noticed"] = {}
     if not isinstance(state.get("spend"), dict):
         state["spend"] = {}
     return state
@@ -1198,16 +1222,51 @@ def count_fail(state, key, err, notices):
 
 # main
 
+def notice_once(state, key, problem, message, notices):
+    """Tell the owner about a configuration problem once, again only when it changes; problem None = fixed."""
+    noticed = state["config_noticed"]
+    if problem is None:
+        noticed.pop(key, None)
+        return
+    log(message)
+    if noticed.get(key) != problem:
+        notices.append(plain(message, 400))
+    noticed[key] = problem
+
+
+def configure(path, state, notices):
+    """Load the configuration and use the projects discovery accepts; ConfigError when none can run."""
+    try:
+        projects = load_config(path)
+    except ConfigError as e:
+        notice_once(state, "config", str(e), f"Triage not run: {e}", notices)
+        raise
+    notice_once(state, "config", None, "", notices)
+    accepted = []
+    for project in projects:
+        try:
+            discover(project)
+        except ConfigError as e:
+            notice_once(state, str(project), str(e), f"Project {project} skipped: {e}", notices)
+            continue
+        notice_once(state, str(project), None, "", notices)
+        accepted.append(project)
+    use_projects(accepted)
+    if not accepted:
+        raise ConfigError("no configured project can run")
+
+
 def make_batches(work):
     """One mode and one project per batch; outside threads alone; each batch directory holds only its own
     context files."""
     shutil.rmtree(CONTEXT, ignore_errors=True)
     groups = []
-    for (mode, m), project in ((x, p) for x in MODES.items() for p in PROJECTS):
-        own = [w for w in work if w["mode"] == mode and proj(w["issue"]) is project]
-        trusted = [w for w in own if w["issue"]["trusted"]]
-        groups += [(mode, trusted[i:i + m.batch]) for i in range(0, len(trusted), m.batch)]
-        groups += [(mode, [w]) for w in own if not w["issue"]["trusted"]]
+    for mode, m in MODES.items():
+        for project in PROJECTS:
+            own = [w for w in work if w["mode"] == mode and proj(w["issue"]) is project]
+            trusted = [w for w in own if w["issue"]["trusted"]]
+            groups += [(mode, trusted[i:i + m.batch]) for i in range(0, len(trusted), m.batch)]
+            groups += [(mode, [w]) for w in own if not w["issue"]["trusted"]]
     batches = []
     for i, (mode, group) in enumerate(groups):
         batch_dir = os.path.join(CONTEXT, f"batch-{i}")
@@ -1285,21 +1344,7 @@ def main():
 
     work = []
     try:
-        VIEWER[0] = json.loads(gh("api", "user"))["login"]
-        accepted = []
-        for project in load_config(args.config):
-            try:
-                discover(project)
-                accepted.append(project)
-            except ConfigError as e:
-                log(f"project skipped: {e}")
-                if state.get("config_noticed", {}).get(str(project)) != str(e):
-                    notices.append(f"Project {project} skipped: {plain(e, 300)}")
-                state.setdefault("config_noticed", {})[str(project)] = str(e)
-                continue
-            state.get("config_noticed", {}).pop(str(project), None)
-        state.get("config_noticed", {}).pop("config", None)
-        use_projects(accepted)
+        configure(args.config, state, notices)
         index = list_index()
         if not args.only:
             run_umbrellas(index, args.dry_run, report, notices, state)
@@ -1360,12 +1405,8 @@ def main():
                     state["relations_checked"][key] = now_iso()
                 continue
             work.append(dict(issue=issue, mode=mode, cands=cands, complete=complete))
-    except ConfigError as e:
-        log(f"configuration: {e}")
-        if state.get("config_noticed", {}).get("config") != str(e):
-            notices.append(f"Triage not run: {plain(e, 300)}")
-        state.setdefault("config_noticed", {})["config"] = str(e)
-        return finish()
+    except ConfigError:
+        return finish()            # configure() has noticed it
     except RuntimeError as e:
         outage(e, "loading issues")
         return finish()
