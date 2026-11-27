@@ -38,6 +38,8 @@ def fake_gql(boards, types=("Bug", "Feature", "Task")):
             b = boards.get((v["owner"], v["n"]))
             return {"repositoryOwner": {"projectV2": b} if b else None}
         if query is t.TYPES_Q:
+            if v["repo"] == "missing":
+                return {"repository": None}
             return {"repository": {"issueTypes": {"nodes": [{"id": f"T-{v['owner']}-{n}", "name": n}
                                                              for n in types]}}}
         raise AssertionError(f"unexpected query {query[:40]}")
@@ -134,6 +136,10 @@ class Discover(unittest.TestCase):
     def test_missing_issue_type(self):
         with self.assertRaises(t.ConfigError):
             self.discover(board("X"), types=("Bug", "Feature"))
+
+    def test_unknown_repository(self):
+        with self.assertRaises(t.ConfigError):
+            self.discover(board("X"), repos={"a": {}, "missing": {}})
 
     def test_product_is_optional(self):
         p = self.discover(board("X", drop_field="Product"), repos={"a": {}})

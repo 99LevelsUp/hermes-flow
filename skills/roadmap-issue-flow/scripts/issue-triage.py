@@ -190,12 +190,17 @@ def discover(project):
         missing = [o for o in wanted or () if o not in project.options.get(name, {})]
         if missing:
             raise ConfigError(f"{project}: field '{name}' lacks the options {', '.join(missing)}")
-    repo = next(iter(project.repos))
-    nodes = gql(TYPES_Q, owner=project.owner, repo=repo)["repository"]["issueTypes"]["nodes"]
-    project.types = {t["name"]: t["id"] for t in nodes}
-    missing = [t for t in ISSUE_TYPES if t not in project.types]
-    if missing:
-        raise ConfigError(f"{project}: the owner has no issue types {', '.join(missing)}")
+    for name in project.repos:
+        repository = gql(TYPES_Q, owner=project.owner, repo=name).get("repository")
+        if not repository:
+            raise ConfigError(f"{project}: repository {project.owner}/{name} not found or not readable")
+        types = {t["name"]: t["id"] for t in repository["issueTypes"]["nodes"]}
+        missing = [t for t in ISSUE_TYPES if t not in types]
+        if missing:
+            raise ConfigError(f"{project}: {name} has no issue types {', '.join(missing)}")
+        if project.types and any(project.types[t] != types[t] for t in ISSUE_TYPES):
+            raise ConfigError(f"{project}: the repositories have different issue types")
+        project.types = types
     for name, repo in project.repos.items():
         if repo.get("product") and repo["product"] not in project.options.get("Product", {}):
             raise ConfigError(f"{project}: Product option '{repo['product']}' (for {name}) does not exist")
