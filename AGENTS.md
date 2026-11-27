@@ -24,6 +24,7 @@ This repository is the source of truth. Hermes runs live copies:
 | `skills/roadmap-issue-flow/` | `~/.hermes/skills/software-development/roadmap-issue-flow/` |
 | `skills/roadmap-issue-flow/scripts/issue-triage.py` | `~/.hermes/scripts/issue-triage.py` (cron scripts must be real files under `~/.hermes/scripts`; the scheduler rejects symlinks that point outside) |
 | `hermes/cron/issue-triage.json` | the cron job in `~/.hermes/cron/jobs.json` |
+| `hermes/triage-config.json` | `~/.hermes/data/issue-triage/config.json`: the projects and repositories triage serves |
 
 - Never change a live copy by hand. Change the repo, go through the flow (issue, branch, PR,
   gates), merge, then run `tools/deploy.sh` on the main checkout.
@@ -49,8 +50,9 @@ Work on this repository follows the skill it contains: `skills/roadmap-issue-flo
 
 - `ruff check .` (configuration in `ruff.toml`)
 - `python3 -m py_compile skills/*/scripts/*.py tools/*.py`
-- Tests: none yet (issue "Tests and CI for the triage script"). Until they exist, every change to
-  the triage script is verified with `--dry-run --only <issues>` before deploying.
+- `python3 -m unittest discover -s tests` (standard library only; the suite grows with issue "Tests
+  and CI for the triage script"). New or changed code of the triage script comes with tests; parts
+  without tests are still verified with `--dry-run --only <issues>` before deploying.
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every push and pull request.
 

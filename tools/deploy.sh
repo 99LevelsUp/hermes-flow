@@ -8,6 +8,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 hermes_home="${HERMES_HOME:-$HOME/.hermes}"
 skill_live="$hermes_home/skills/software-development/roadmap-issue-flow"
 script_live="$hermes_home/scripts/issue-triage.py"
+config_live="$hermes_home/data/issue-triage/config.json"
 stamp="$hermes_home/data/hermes-flow/deployed-commit"
 force=0
 [[ "${1:-}" == "--force" ]] && force=1
@@ -25,18 +26,27 @@ if [[ -f "$stamp" && $force -eq 0 ]]; then
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT
 	git archive "$last" skills/roadmap-issue-flow | tar -x -C "$tmp"
+	config_drift=0
+	# the configuration is deployed since #31; a deploy from before it left none to compare
+	if git cat-file -e "$last:hermes/triage-config.json" 2>/dev/null; then
+		git show "$last:hermes/triage-config.json" >"$tmp/config.json"
+		cmp -s "$tmp/config.json" "$config_live" || config_drift=1
+	fi
 	if ! diff -r -q -x scripts "$tmp/skills/roadmap-issue-flow" "$skill_live" >/dev/null ||
-		! cmp -s "$tmp/skills/roadmap-issue-flow/scripts/issue-triage.py" "$script_live"; then
+		! cmp -s "$tmp/skills/roadmap-issue-flow/scripts/issue-triage.py" "$script_live" || ((config_drift)); then
 		echo "deploy: a live copy changed since $last; carry the change into the repo first:" >&2
 		diff -r -u -x scripts "$tmp/skills/roadmap-issue-flow" "$skill_live" >&2 || true
 		diff -u "$tmp/skills/roadmap-issue-flow/scripts/issue-triage.py" "$script_live" >&2 || true
+		((config_drift)) && { diff -u "$tmp/config.json" "$config_live" >&2 || true; }
 		exit 1
 	fi
 fi
 
-mkdir -p "$skill_live" "$(dirname "$script_live")" "$(dirname "$stamp")"
+mkdir -p "$skill_live" "$(dirname "$script_live")" "$(dirname "$config_live")" "$(dirname "$stamp")"
 rsync -a --delete --exclude scripts skills/roadmap-issue-flow/ "$skill_live/"
 install -m 0644 skills/roadmap-issue-flow/scripts/issue-triage.py "$script_live.tmp"
 mv "$script_live.tmp" "$script_live"
+install -m 0644 hermes/triage-config.json "$config_live.tmp"
+mv "$config_live.tmp" "$config_live"
 git rev-parse HEAD >"$stamp"
 echo "deployed $(git rev-parse --short HEAD) to $hermes_home"
