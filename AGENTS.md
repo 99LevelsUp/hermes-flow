@@ -41,7 +41,7 @@ Work on this repository follows the skill it contains: `skills/roadmap-issue-flo
 - Roadmap: GitHub project "Hermes flow" (user project of 99LevelsUp), the same fields as the EVƎ
   roadmap (Status, Priority, Product, Estimate, Next step, Milestone).
 - One problem = one issue (`## What`, `## Why`, `Source:`), kind of work by issue type only
-  (Bug / Feature / Task), label `idea` until the Ready gate.
+  (Bug / Feature / Task); the project Status shows whether it passed the Ready gate.
 - Each item or bundle: own branch and worktree, tests that fail without the fix, a PR with
   `Closes #N`, gates ce-simplify-code then ce-code-review (ce-doc-review for documents), green CI.
 - Priority, milestones, merging, closing and releases are the owner's decisions.
