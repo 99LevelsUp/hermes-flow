@@ -31,3 +31,7 @@ tools/deploy.sh          # copies the skill and the cron script into ~/.hermes
 ```
 
 Agents: read `AGENTS.md` first.
+
+## License
+
+MIT, see `LICENSE`.

@@ -3,7 +3,7 @@ name: roadmap-issue-flow
 description: "Use when handling issues on a GitHub roadmap. CE+gh flow."
 version: 1.1.0
 author: owner (99LevelsUp) + Hermes
-license: proprietary
+license: MIT
 metadata:
   hermes:
     tags: [github, roadmap, issues, compound-engineering, projects-v2, workflow]
